@@ -12,9 +12,14 @@ import (
 // Source is the shared, durable backing store for the kill-switch — Postgres or Redis in
 // production (ADR-004). All gateway replicas and the admin/control plane share one Source;
 // that shared state is how a revocation reaches every replica (NFR-2).
+//
+// Revoke and Restore take a batch and MUST apply it atomically: either every id is durably
+// written or none is. The control plane revokes a principal and all of its agents in one
+// call (FR-19), and a cascade that half-lands leaves descendants operating after the
+// operator was told the principal was cut off. Calling with no ids is a no-op.
 type Source interface {
-	Revoke(id string) error
-	Restore(id string) error
+	Revoke(ids ...string) error
+	Restore(ids ...string) error
 	List() ([]string, error)
 }
 
@@ -27,19 +32,23 @@ type MemSource struct {
 // NewMemSource returns an empty in-memory Source.
 func NewMemSource() *MemSource { return &MemSource{set: map[string]struct{}{}} }
 
-// Revoke implements Source.
-func (s *MemSource) Revoke(id string) error {
+// Revoke implements Source. The batch is applied under one lock, so it is atomic.
+func (s *MemSource) Revoke(ids ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.set[id] = struct{}{}
+	for _, id := range ids {
+		s.set[id] = struct{}{}
+	}
 	return nil
 }
 
-// Restore implements Source.
-func (s *MemSource) Restore(id string) error {
+// Restore implements Source. The batch is applied under one lock, so it is atomic.
+func (s *MemSource) Restore(ids ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.set, id)
+	for _, id := range ids {
+		delete(s.set, id)
+	}
 	return nil
 }
 
@@ -299,26 +308,30 @@ func (c *CachedStore) Revoked(id string) bool {
 	return ok
 }
 
-// Revoke writes through to the Source, then updates the local snapshot. On a Source error
-// the local snapshot is left unchanged (all-or-nothing) so it never diverges from durable
-// state.
-func (c *CachedStore) Revoke(id string) error {
-	if err := c.src.Revoke(id); err != nil {
+// Revoke writes ids through to the Source, then updates the local snapshot. The Source write
+// is atomic (Source contract) and on any error the local snapshot is left unchanged
+// (all-or-nothing) so it never diverges from durable state.
+func (c *CachedStore) Revoke(ids ...string) error {
+	if err := c.src.Revoke(ids...); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.snapshot[id] = struct{}{}
+	for _, id := range ids {
+		c.snapshot[id] = struct{}{}
+	}
 	c.mu.Unlock()
 	return nil
 }
 
-// Restore writes through to the Source, then updates the local snapshot.
-func (c *CachedStore) Restore(id string) error {
-	if err := c.src.Restore(id); err != nil {
+// Restore writes ids through to the Source, then updates the local snapshot.
+func (c *CachedStore) Restore(ids ...string) error {
+	if err := c.src.Restore(ids...); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	delete(c.snapshot, id)
+	for _, id := range ids {
+		delete(c.snapshot, id)
+	}
 	c.mu.Unlock()
 	return nil
 }

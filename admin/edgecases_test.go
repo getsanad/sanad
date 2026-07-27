@@ -198,7 +198,9 @@ func TestRestoreClearsDisabledFlag(t *testing.T) {
 	if err := svc.Revoke(ctx, "p1"); err != nil {
 		t.Fatal(err)
 	}
-	svc.Restore("p1")
+	if err := svc.Restore("p1"); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
 
 	if kill.Revoked("p1") {
 		t.Fatal("p1 should be off the kill-switch after restore")

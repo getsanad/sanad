@@ -69,7 +69,9 @@ agents ──HTTP──▶  gateway (this server)  ──▶  your protected MCP
 ```
 
 ```sh
-# Gateway (dev: allow-all policy). Exposes /healthz, /metrics, /.well-known/jwks.json.
+# Gateway (dev: allow-all policy, PASSPORT_DEV_NO_AUTH=1). Exposes /healthz, /metrics,
+# /.well-known/jwks.json. Without principal auth configured startup is fatal unless
+# PASSPORT_DEV_NO_AUTH=1 — and then every proxied request is denied.
 make run
 #   PASSPORT_GATEWAY_ADDR        listen address (default :8080)
 #   PASSPORT_SERVERS             "id=https://upstream,..." protected MCP servers
@@ -77,6 +79,7 @@ make run
 #   PASSPORT_OIDC_ISSUER/_CLIENT_ID   (oidc mode)
 #   PASSPORT_VC_TRUSTED_ISSUERS  comma-separated trusted issuer DIDs (vc mode)
 #   PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey → enables instance auth + delegation
+#   PASSPORT_DEV_NO_AUTH         1 = start without principal auth (dev only)
 
 # Admin control plane (set PASSPORT_ADMIN_TOKEN to require auth).
 make run-admin

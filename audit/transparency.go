@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"sync"
 )
 
 // SignedCheckpoint is a signed commitment to the log at a point in time: its size and
@@ -25,6 +26,7 @@ type TransparencyLog struct {
 	signer ed25519.PrivateKey
 	kid    string
 
+	mu     sync.Mutex
 	leaves [][]byte // leaf data = each entry's chain hash (a commitment to the entry)
 }
 
@@ -36,13 +38,20 @@ func NewTransparencyLog(signer ed25519.PrivateKey, kid string, sink Sink) (*Tran
 	return &TransparencyLog{chain: NewHashChainLog(sink), signer: signer, kid: kid}, nil
 }
 
-// Append records an entry (chain + sink) and adds its commitment as a Merkle leaf.
-func (l *TransparencyLog) Append(ctx context.Context, e Entry) error {
-	if err := l.chain.Append(ctx, e); err != nil {
-		return err
+// Append records an entry (chain + sink) and adds its commitment as a Merkle leaf. The
+// chain append and the leaf append are one critical section, so leaf i is always the hash
+// of entry i: locking the leaves alone would stop the data race but still let two appends
+// commit their leaves in the opposite order from the chain, which yields inclusion proofs
+// for the wrong entry. Streaming to the sink stays outside the lock, as in HashChainLog.
+func (l *TransparencyLog) Append(_ context.Context, e Entry) error {
+	l.mu.Lock()
+	stored, sink := l.chain.commit(e)
+	l.leaves = append(l.leaves, stored.Hash)
+	l.mu.Unlock()
+
+	if sink != nil {
+		return sink.Write(stored)
 	}
-	entries := l.chain.Entries()
-	l.leaves = append(l.leaves, entries[len(entries)-1].Hash)
 	return nil
 }
 
@@ -52,10 +61,26 @@ func (l *TransparencyLog) Verify() error                         { return l.chai
 func (l *TransparencyLog) Investigate(id string) (Report, error) { return l.chain.Investigate(id) }
 
 // Size is the number of entries.
-func (l *TransparencyLog) Size() int { return len(l.leaves) }
+func (l *TransparencyLog) Size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.leaves)
+}
 
 // Root is the current Merkle tree head.
-func (l *TransparencyLog) Root() []byte { return Root(l.leaves) }
+func (l *TransparencyLog) Root() []byte { return Root(l.snapshot()) }
+
+// snapshot copies the leaf list. Every reader works from one snapshot, so it sees a single
+// log state (never a size and a root from different ones) and the O(n) Merkle math runs
+// without holding the lock against concurrent appends. The leaf hashes are never mutated,
+// so sharing the underlying arrays is safe.
+func (l *TransparencyLog) snapshot() [][]byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([][]byte, len(l.leaves))
+	copy(out, l.leaves)
+	return out
+}
 
 // PublicKey returns the checkpoint verification key.
 func (l *TransparencyLog) PublicKey() ed25519.PublicKey {
@@ -64,7 +89,8 @@ func (l *TransparencyLog) PublicKey() ed25519.PublicKey {
 
 // Checkpoint returns a signed commitment to the current log state.
 func (l *TransparencyLog) Checkpoint() SignedCheckpoint {
-	cp := SignedCheckpoint{Size: len(l.leaves), Root: Root(l.leaves), KeyID: l.kid}
+	leaves := l.snapshot()
+	cp := SignedCheckpoint{Size: len(leaves), Root: Root(leaves), KeyID: l.kid}
 	cp.Signature = ed25519.Sign(l.signer, checkpointMsg(cp))
 	return cp
 }
@@ -72,16 +98,17 @@ func (l *TransparencyLog) Checkpoint() SignedCheckpoint {
 // InclusionProof returns the leaf data and audit path for the entry at index, to verify
 // against a checkpoint root with VerifyInclusion.
 func (l *TransparencyLog) InclusionProof(index int) (leaf []byte, proof [][]byte, err error) {
-	if index < 0 || index >= len(l.leaves) {
+	leaves := l.snapshot()
+	if index < 0 || index >= len(leaves) {
 		return nil, nil, errors.New("audit: index out of range")
 	}
-	proof, err = InclusionProof(l.leaves, index)
-	return l.leaves[index], proof, err
+	proof, err = InclusionProof(leaves, index)
+	return leaves[index], proof, err
 }
 
 // ConsistencyProof proves the log at oldSize is a prefix of the current log.
 func (l *TransparencyLog) ConsistencyProof(oldSize int) ([][]byte, error) {
-	return ConsistencyProof(l.leaves, oldSize)
+	return ConsistencyProof(l.snapshot(), oldSize)
 }
 
 // VerifyCheckpoint checks a checkpoint's operator signature.

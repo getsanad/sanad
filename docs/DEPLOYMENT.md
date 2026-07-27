@@ -105,8 +105,18 @@ Gateway (full list in `cmd/gateway/main.go`):
 | `PASSPORT_FORWARD_HEADERS` | comma-separated extra inbound headers to forward upstream; by default only the minted passport plus a minimal MCP transport set survives (token isolation, FR-8) |
 | `PASSPORT_REVOCATION_DSN` | Postgres DSN for the shared kill-switch (empty = in-memory) |
 | `PASSPORT_REVOCATION_REFRESH` | cache refresh interval (default 2s) — keep well under your revocation SLA |
+| `PASSPORT_REVOCATION_MAX_STALENESS` | snapshot age past which revocation checks **deny** and `/readyz` reports unready (default 60s, the NFR-4 target); must exceed the refresh interval |
 | `PASSPORT_ALLOW_ALL` | `1` permits everything (**dev only**) |
 | `PASSPORT_DEV_NO_AUTH` | `1` starts without principal auth (**dev only**); otherwise a missing principal authenticator is a fatal startup error |
 
 The `PASSPORT_REVOCATION_DSN` must point every gateway replica **and** the admin service at
 the same database for the kill-switch to be global.
+
+If that database becomes unreachable, each replica keeps serving its last snapshot — but
+only for `PASSPORT_REVOCATION_MAX_STALENESS`. During the outage the gateway logs the failure
+(first occurrence, the moment the bound is crossed, then a heartbeat), exports the age as
+`agentpassport_revocation_snapshot_age_seconds`, and once the bound is crossed it denies
+every request and fails `/readyz`. That is deliberate: past the bound the gateway can no
+longer promise a revocation has reached it (NFR-4), and a kill-switch that cannot see its
+deny list must stop traffic rather than wave it through. **Alert on the gauge approaching
+the bound** — it goes off long before any request is denied.

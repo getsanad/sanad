@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/getsanad/sanad/gateway"
 	"github.com/getsanad/sanad/pkg/types"
+	"github.com/getsanad/sanad/revoke"
 	"github.com/getsanad/sanad/sts"
 )
 
@@ -39,7 +41,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 
 	t.Run("unconfigured is fatal", func(t *testing.T) {
 		clearAuthEnv(t)
-		_, err := buildPipeline(context.Background(), signer)
+		_, _, err := buildPipeline(context.Background(), signer)
 		if err == nil {
 			t.Fatal("want a startup error with no principal authenticator configured, got nil")
 		}
@@ -54,7 +56,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("vc mode names the vc var", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
-		_, err := buildPipeline(context.Background(), signer)
+		_, _, err := buildPipeline(context.Background(), signer)
 		if err == nil || !strings.Contains(err.Error(), "PASSPORT_VC_TRUSTED_ISSUERS") {
 			t.Fatalf("want an error naming PASSPORT_VC_TRUSTED_ISSUERS, got %v", err)
 		}
@@ -63,7 +65,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("dev escape hatch", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_DEV_NO_AUTH", "1")
-		p, err := buildPipeline(context.Background(), signer)
+		p, _, err := buildPipeline(context.Background(), signer)
 		if err != nil {
 			t.Fatalf("PASSPORT_DEV_NO_AUTH=1: %v", err)
 		}
@@ -98,7 +100,7 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 	// delegationStage builds the configured pipeline and returns its delegation stage.
 	delegationStage := func(t *testing.T) gateway.Stage {
 		t.Helper()
-		p, err := buildPipeline(context.Background(), signer)
+		p, _, err := buildPipeline(context.Background(), signer)
 		if err != nil {
 			t.Fatalf("buildPipeline: %v", err)
 		}
@@ -133,4 +135,74 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 			t.Fatalf("PASSPORT_ALLOW_DIRECT_PRINCIPAL=1: %v", err)
 		}
 	})
+}
+
+// TestRevocationTiming covers the shared kill-switch's staleness configuration: the NFR-4
+// bound is the default, and a bound that would deny on a single missed refresh is rejected
+// at startup rather than silently turning the gateway into a coin flip.
+func TestRevocationTiming(t *testing.T) {
+	cases := []struct {
+		name             string
+		refresh, maxStal string
+		wantRefresh      time.Duration
+		wantMax          time.Duration
+		wantErr          string
+	}{
+		{name: "defaults", wantRefresh: 2 * time.Second, wantMax: revoke.DefaultMaxStaleness},
+		{name: "explicit", refresh: "5s", maxStal: "30s", wantRefresh: 5 * time.Second, wantMax: 30 * time.Second},
+		{name: "bound at refresh interval", refresh: "10s", maxStal: "10s", wantErr: "must be greater than"},
+		{name: "bound under refresh interval", refresh: "10s", maxStal: "1s", wantErr: "must be greater than"},
+		{name: "bound disabled explicitly", maxStal: "0s", wantRefresh: 2 * time.Second, wantMax: 0},
+		{name: "unparseable bound", maxStal: "soon", wantErr: "PASSPORT_REVOCATION_MAX_STALENESS"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PASSPORT_REVOCATION_REFRESH", tc.refresh)
+			t.Setenv("PASSPORT_REVOCATION_MAX_STALENESS", tc.maxStal)
+
+			refresh, maxStale, err := revocationTiming()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("got %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if refresh != tc.wantRefresh || maxStale != tc.wantMax {
+				t.Fatalf("got refresh=%s maxStale=%s, want %s / %s", refresh, maxStale, tc.wantRefresh, tc.wantMax)
+			}
+		})
+	}
+}
+
+// TestBuildPipelineReturnsKillSwitchForProbes: main wires the returned store into /readyz
+// and the snapshot-age gauge, so buildPipeline must hand one back on every path — including
+// the dev no-auth path, where it would otherwise be nil-dereferenced at startup.
+func TestBuildPipelineReturnsKillSwitchForProbes(t *testing.T) {
+	signer, err := sts.NewLocalSigner("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, devNoAuth := range []string{"1", ""} {
+		clearAuthEnv(t)
+		if devNoAuth == "" {
+			t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
+			t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
+		} else {
+			t.Setenv("PASSPORT_DEV_NO_AUTH", devNoAuth)
+		}
+		_, ks, err := buildPipeline(context.Background(), signer)
+		if err != nil {
+			t.Fatalf("PASSPORT_DEV_NO_AUTH=%q: %v", devNoAuth, err)
+		}
+		if ks == nil {
+			t.Fatalf("PASSPORT_DEV_NO_AUTH=%q: no kill-switch returned for /readyz to check", devNoAuth)
+		}
+		// The in-memory dev source has no background refresh, so it must never go stale.
+		if err := ks.CheckFresh(); err != nil {
+			t.Fatalf("freshly built kill-switch reports stale: %v", err)
+		}
+	}
 }

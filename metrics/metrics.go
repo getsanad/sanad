@@ -22,11 +22,19 @@ type reqKey struct {
 	code   string
 }
 
+// gauge is a value sampled at scrape time from a live source rather than accumulated on the
+// request path — e.g. the age of the gateway's kill-switch snapshot (NFR-4).
+type gauge struct {
+	help  string
+	value func() float64
+}
+
 // Registry holds the gateway's metrics. It is safe for concurrent use.
 type Registry struct {
 	mu       sync.Mutex
 	requests map[reqKey]uint64
 	hist     histogram
+	gauges   map[string]gauge
 }
 
 // NewRegistry returns an empty metrics registry.
@@ -34,7 +42,20 @@ func NewRegistry() *Registry {
 	return &Registry{
 		requests: map[reqKey]uint64{},
 		hist:     newHistogram(defaultBuckets),
+		gauges:   map[string]gauge{},
 	}
+}
+
+// SetGauge registers a gauge whose value is read at scrape time. Registering the same name
+// again replaces it; a nil value function removes it.
+func (r *Registry) SetGauge(name, help string, value func() float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if value == nil {
+		delete(r.gauges, name)
+		return
+	}
+	r.gauges[name] = gauge{help: help, value: value}
 }
 
 // Observe records one served request: its target server, HTTP status, and duration.
@@ -85,6 +106,18 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintf(w, "agentpassport_request_duration_seconds_bucket{le=\"+Inf\"} %d\n", r.hist.count)
 	fmt.Fprintf(w, "agentpassport_request_duration_seconds_sum %g\n", r.hist.sum)
 	fmt.Fprintf(w, "agentpassport_request_duration_seconds_count %d\n", r.hist.count)
+
+	names := make([]string, 0, len(r.gauges))
+	for name := range r.gauges {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		g := r.gauges[name]
+		fmt.Fprintf(w, "# HELP %s %s\n", name, g.help)
+		fmt.Fprintf(w, "# TYPE %s gauge\n", name)
+		fmt.Fprintf(w, "%s %g\n", name, g.value())
+	}
 }
 
 // histogram tracks cumulative bucket counts plus sum/count.

@@ -26,6 +26,17 @@ type Checker interface {
 	Revoked(id string) bool
 }
 
+// FreshnessChecker is the optional companion to Checker for implementations that answer
+// from a periodically refreshed snapshot rather than from authoritative local state. Revoked
+// returns a bool, which has no way to say "I don't know" — so the freshness of the snapshot
+// behind it is asked separately, here. Stage consults it before trusting any Revoked answer;
+// a Checker that cannot go stale (MemStore) simply does not implement it.
+type FreshnessChecker interface {
+	// CheckFresh returns nil while the local view is recent enough to be trusted, and an
+	// error describing the staleness once it is not.
+	CheckFresh() error
+}
+
 // Store is the kill-switch / deny-list. Revoking an id immediately stops issuance for it.
 type Store interface {
 	Checker
@@ -85,8 +96,20 @@ func (m *MemStore) List() []string {
 // agent's blueprint is on the kill-switch. It runs after identity is established and
 // before minting, so a revoked party can never obtain a passport. It needs only a Checker,
 // so it works with the in-process MemStore or the multi-replica CachedStore.
+//
+// When the Checker is snapshot-backed (FreshnessChecker) the stage first asks whether that
+// snapshot can still be trusted, and denies the request outright if it cannot. That is the
+// fail-closed direction and the reason this check lives here rather than inside Revoked:
+// a stale kill-switch cannot rule anyone out, so it must stop everyone — including
+// principals that authenticated cleanly, since principal.StatusChecker consults the same
+// snapshot and gets the same unknowable answer (NFR-4).
 func Stage(c Checker) gateway.Stage {
 	return gateway.NewStage("revocation", func(_ context.Context, req *gateway.Request) error {
+		if f, ok := c.(FreshnessChecker); ok {
+			if err := f.CheckFresh(); err != nil {
+				return fmt.Errorf("revocation: %w", err)
+			}
+		}
 		if req.Principal != nil && c.Revoked(req.Principal.ID) {
 			return fmt.Errorf("revocation: principal %q is revoked", req.Principal.ID)
 		}

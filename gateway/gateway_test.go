@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/getsanad/sanad/pkg/types"
@@ -169,5 +170,43 @@ func TestHealthAndReady(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: got %d, want 200", path, rec.Code)
 		}
+	}
+}
+
+// TestReadyHookGatesReadiness: a dependency the gateway cannot decide safely without — a
+// kill-switch snapshot that has gone stale (NFR-4) — must take the replica out of the load
+// balancer. Liveness is unaffected: the process is fine, it just should not be routed to.
+func TestReadyHookGatesReadiness(t *testing.T) {
+	fail := errors.New("kill-switch snapshot is stale: last successful refresh 3m0s ago (max 1m0s)")
+	var ready error
+	g := &Gateway{Registry: NewRegistry(), Ready: func() error { return ready }}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+
+	if rec := get("/readyz"); rec.Code != http.StatusOK {
+		t.Fatalf("a passing Ready hook: got %d, want 200", rec.Code)
+	}
+
+	ready = fail
+	rec := get("/readyz")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a failing Ready hook: got %d, want 503", rec.Code)
+	}
+	// The probe body has to name the reason, or an operator sees only "not ready".
+	if !strings.Contains(rec.Body.String(), "stale") {
+		t.Fatalf("readiness body %q does not explain the failure", rec.Body.String())
+	}
+	if rec := get("/healthz"); rec.Code != http.StatusOK {
+		t.Fatalf("liveness must stay 200 while unready: got %d", rec.Code)
+	}
+
+	// Recovery is automatic — readiness is sampled per probe, not latched.
+	ready = nil
+	if rec := get("/readyz"); rec.Code != http.StatusOK {
+		t.Fatalf("after recovery: got %d, want 200", rec.Code)
 	}
 }

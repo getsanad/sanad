@@ -62,3 +62,37 @@ func TestHistogramCumulative(t *testing.T) {
 		t.Fatalf("total count = %d, want 3", h.count)
 	}
 }
+
+// TestGaugeSampledAtScrape: a gauge reads its value when scraped, not when registered, so
+// a live quantity like the kill-switch snapshot age (NFR-4) is always current.
+func TestGaugeSampledAtScrape(t *testing.T) {
+	reg := NewRegistry()
+	age := 0.0
+	reg.SetGauge("agentpassport_revocation_snapshot_age_seconds", "Snapshot age.", func() float64 { return age })
+
+	scrape := func() string {
+		rec := httptest.NewRecorder()
+		reg.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	body := scrape()
+	for _, want := range []string{
+		"# TYPE agentpassport_revocation_snapshot_age_seconds gauge",
+		"agentpassport_revocation_snapshot_age_seconds 0",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in:\n%s", want, body)
+		}
+	}
+
+	age = 87.5
+	if !strings.Contains(scrape(), "agentpassport_revocation_snapshot_age_seconds 87.5") {
+		t.Fatalf("gauge not re-sampled at scrape time:\n%s", scrape())
+	}
+
+	reg.SetGauge("agentpassport_revocation_snapshot_age_seconds", "", nil)
+	if strings.Contains(scrape(), "agentpassport_revocation_snapshot_age_seconds") {
+		t.Fatalf("a nil value function should unregister the gauge:\n%s", scrape())
+	}
+}

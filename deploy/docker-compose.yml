@@ -77,6 +77,9 @@ services:
       PASSPORT_ALLOW_ALL: "1"
       PASSPORT_REVOCATION_DSN: *revocation-dsn
       PASSPORT_REVOCATION_REFRESH: "2s"
+      # Past this much staleness the gateway denies and reports unready rather than serve a
+      # snapshot it can no longer promise is current (NFR-4).
+      PASSPORT_REVOCATION_MAX_STALENESS: "60s"
     ports:
       - "8080:8080"
 

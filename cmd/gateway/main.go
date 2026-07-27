@@ -15,10 +15,12 @@
 //	PASSPORT_SIGNING_KID         signing key id (default gateway-dev)
 //	PASSPORT_REVOCATION_DSN      Postgres DSN for a shared kill-switch (empty = in-memory)
 //	PASSPORT_REVOCATION_REFRESH  cache refresh interval for the shared kill-switch (default 2s)
+//	PASSPORT_DEV_NO_AUTH         1 = start without principal auth (development only)
 //
-// With no principal authenticator configured the pipeline is empty; with no registered
-// servers every request fails closed. In vc mode, a configured workload CA lets principal
-// keys self-provision for delegation. The dev LocalSigner is replaced by KMS/HSM in P1-12.
+// With no principal authenticator configured startup is a fatal error unless
+// PASSPORT_DEV_NO_AUTH=1; with no registered servers every request fails closed. In vc mode,
+// a configured workload CA lets principal keys self-provision for delegation. The dev
+// LocalSigner is replaced by KMS/HSM in P1-12.
 package main
 
 import (
@@ -142,8 +144,20 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 	if err != nil {
 		return gateway.Pipeline{}, err
 	}
+	// Never serve unauthenticated by accident. A pipeline with no principal stage mints no
+	// passport, so the gateway denies every proxied request (gateway/proxy.go) while looking
+	// healthy — and before that check existed it was an open proxy. Fail startup instead;
+	// PASSPORT_DEV_NO_AUTH=1 is the explicit opt-in for local development and the demo.
 	if auth == nil {
-		log.Print("no principal authenticator configured; running with an empty pipeline")
+		if os.Getenv("PASSPORT_DEV_NO_AUTH") != "1" {
+			need := "PASSPORT_OIDC_ISSUER and PASSPORT_OIDC_CLIENT_ID"
+			if os.Getenv("PASSPORT_PRINCIPAL_MODE") == "vc" {
+				need = "PASSPORT_VC_TRUSTED_ISSUERS"
+			}
+			return gateway.Pipeline{}, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
+				envOr("PASSPORT_PRINCIPAL_MODE", "oidc"), need)
+		}
+		log.Print("WARNING: PASSPORT_DEV_NO_AUTH=1: no principal authentication configured; every proxied request will be denied (development only)")
 		return gateway.Pipeline{}, nil
 	}
 
@@ -173,7 +187,8 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 }
 
 // buildPrincipalAuth selects the principal authenticator by PASSPORT_PRINCIPAL_MODE
-// ("oidc" default, or "vc"). Returns nil when nothing is configured (empty pipeline). In
+// ("oidc" default, or "vc"). Returns nil when nothing is configured, which buildPipeline
+// turns into a fatal startup error unless PASSPORT_DEV_NO_AUTH=1. In
 // VC mode a non-nil key store is wired as the registrar so authenticated principals'
 // did:key public keys self-provision for delegation.
 func buildPrincipalAuth(ctx context.Context, ks principal.StatusChecker, store *workload.KeyStore) (principal.Authenticator, error) {

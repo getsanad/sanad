@@ -104,6 +104,7 @@ Gateway (full list in `cmd/gateway/main.go`):
 | `PASSPORT_REVOCATION_DSN` | Postgres DSN for the shared kill-switch (empty = in-memory) |
 | `PASSPORT_REVOCATION_REFRESH` | cache refresh interval (default 2s) — keep well under your revocation SLA |
 | `PASSPORT_ALLOW_ALL` | `1` permits everything (**dev only**) |
+| `PASSPORT_DEV_NO_AUTH` | `1` starts without principal auth (**dev only**); otherwise a missing principal authenticator is a fatal startup error |
 
 The `PASSPORT_REVOCATION_DSN` must point every gateway replica **and** the admin service at
 the same database for the kill-switch to be global.

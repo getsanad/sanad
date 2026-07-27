@@ -29,10 +29,11 @@ check: build vet test
 demo:
 	go run ./cmd/demo
 
-# Run the gateway locally (dev: allow-all policy, no servers registered yet).
+# Run the gateway locally (dev: allow-all policy, no principal auth, no servers registered
+# yet — so every proxied request is denied until you configure one).
 # Set PASSPORT_SERVERS / PASSPORT_PRINCIPAL_MODE etc. to configure — see README.
 run:
-	PASSPORT_ALLOW_ALL=1 go run ./cmd/gateway
+	PASSPORT_ALLOW_ALL=1 PASSPORT_DEV_NO_AUTH=1 go run ./cmd/gateway
 
 # Run the admin control-plane API locally (UNAUTHENTICATED unless PASSPORT_ADMIN_TOKEN set).
 run-admin:

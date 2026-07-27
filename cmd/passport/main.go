@@ -67,7 +67,8 @@ Usage:
       --listen ADDR       local address (default 127.0.0.1:7070)
       --token-env VAR     env var with the principal bearer token (default PASSPORT_PRINCIPAL_TOKEN)
       --token-file FILE   file with the principal bearer token (overrides --token-env)
-      --delegation FILE   optional delegation chain JSON`)
+      --delegation FILE   delegation chain JSON (gateways with delegation enabled
+                          require one unless PASSPORT_ALLOW_DIRECT_PRINCIPAL=1)`)
 	os.Exit(2)
 }
 
@@ -144,7 +145,7 @@ func runProxy(args []string) {
 	credFile := fs.String("credential", "", "workload credential JSON file (required)")
 	tokenEnv := fs.String("token-env", "PASSPORT_PRINCIPAL_TOKEN", "env var holding the principal bearer token")
 	tokenFile := fs.String("token-file", "", "file holding the principal bearer token (overrides --token-env)")
-	delegationFile := fs.String("delegation", "", "optional delegation chain JSON file")
+	delegationFile := fs.String("delegation", "", "delegation chain JSON file (required by gateways with delegation enabled)")
 	_ = fs.Parse(args)
 
 	if *gatewayURL == "" || *keyFile == "" || *credFile == "" {

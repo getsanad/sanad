@@ -149,8 +149,11 @@ const (
 
 // CapabilityStage is the offline delegation mode (FR-12b): an alternative to Stage. It
 // verifies a presented capability against rootPub and a holder proof over the principal's
-// bearer token, then narrows the request scope to the effective grant. Fails closed.
-func CapabilityStage(rootPub ed25519.PublicKey) gateway.Stage {
+// bearer token, then narrows the request scope to the effective grant. Fails closed. A
+// request with no capability lets the principal act directly unless WithRequireChain is
+// set, which rejects it.
+func CapabilityStage(rootPub ed25519.PublicKey, opts ...StageOption) gateway.Stage {
+	o := newStageOptions(opts)
 	return gateway.NewStage("capability", func(_ context.Context, req *gateway.Request) error {
 		if req.Principal == nil {
 			return errors.New("delegation: no authenticated principal")
@@ -160,6 +163,9 @@ func CapabilityStage(rootPub ed25519.PublicKey) gateway.Stage {
 		}
 		raw := req.HTTP.Header.Get(HeaderCapability)
 		if raw == "" {
+			if o.requireChain {
+				return errors.New("delegation: no capability presented (a capability is required)")
+			}
 			return nil // no capability presented; principal acts directly
 		}
 		c, err := DecodeCapability(raw)

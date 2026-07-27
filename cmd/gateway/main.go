@@ -11,6 +11,7 @@
 //	PASSPORT_OIDC_CLIENT_ID      expected audience / client id (oidc mode)
 //	PASSPORT_VC_TRUSTED_ISSUERS  comma-separated trusted issuer DIDs (vc mode)
 //	PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey; enables instance auth + delegation
+//	PASSPORT_ALLOW_DIRECT_PRINCIPAL  1 = accept requests with no delegation chain (default: reject)
 //	PASSPORT_ISSUER_NAME         `iss` placed on minted passports (default sanad)
 //	PASSPORT_SIGNING_KID         signing key id (default gateway-dev)
 //	PASSPORT_REVOCATION_DSN      Postgres DSN for a shared kill-switch (empty = in-memory)
@@ -18,9 +19,10 @@
 //	PASSPORT_DEV_NO_AUTH         1 = start without principal auth (development only)
 //
 // With no principal authenticator configured startup is a fatal error unless
-// PASSPORT_DEV_NO_AUTH=1; with no registered servers every request fails closed. In vc mode,
-// a configured workload CA lets principal keys self-provision for delegation. The dev
-// LocalSigner is replaced by KMS/HSM in P1-12.
+// PASSPORT_DEV_NO_AUTH=1; with no registered servers every request fails closed. Once a
+// workload CA enables delegation, a request carrying no chain is rejected unless
+// PASSPORT_ALLOW_DIRECT_PRINCIPAL=1. In vc mode, a configured workload CA lets principal
+// keys self-provision for delegation. The dev LocalSigner is replaced by KMS/HSM in P1-12.
 package main
 
 import (
@@ -165,9 +167,22 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 	// after the agent is established so agent revocation is enforced too.
 	stages := []gateway.Stage{principal.Stage(auth)}
 	if store != nil {
+		// Delegation is REQUIRED once it is enabled. Without that, presenting a chain is
+		// opt-in per request: a delegate holding a chain attenuated to ["read"] could omit
+		// X-Agent-Delegation, still authenticate as its agent, and be minted a passport with
+		// no scope at all — which is unconstrained, i.e. wider than the chain it holds.
+		// PASSPORT_ALLOW_DIRECT_PRINCIPAL=1 restores the permissive behaviour for deployments
+		// where a principal legitimately calls with no delegation (the sidecar's --delegation
+		// flag is optional); the default is the safe one.
+		var dopts []delegation.StageOption
+		if os.Getenv("PASSPORT_ALLOW_DIRECT_PRINCIPAL") == "1" {
+			log.Print("PASSPORT_ALLOW_DIRECT_PRINCIPAL=1: requests with no delegation chain are permitted (the principal acts directly, with no scope narrowing)")
+		} else {
+			dopts = append(dopts, delegation.WithRequireChain())
+		}
 		stages = append(stages,
 			workload.InstanceStage(caPub, store),
-			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation)),
+			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation), dopts...),
 		)
 		log.Print("instance auth + delegation enabled (PASSPORT_WORKLOAD_CA set)")
 	}

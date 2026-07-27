@@ -1,10 +1,17 @@
 package delegation
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/pkg/types"
 )
 
 func rootKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -120,6 +127,54 @@ func TestCapabilityRecipientCannotBroaden(t *testing.T) {
 		t.Fatal("recipient must NOT be able to wield the broader parent token with only the narrowed secret")
 	}
 	_ = narrowed
+}
+
+const capTestToken = "principal-token"
+
+// capRequest builds an authenticated gateway request, optionally presenting a capability.
+func capRequest(capHdr, proofHdr string) *gateway.Request {
+	r := httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil)
+	r.Header.Set("Authorization", "Bearer "+capTestToken)
+	if capHdr != "" {
+		r.Header.Set(HeaderCapability, capHdr)
+		r.Header.Set(HeaderCapabilityProof, proofHdr)
+	}
+	return &gateway.Request{HTTP: r, Principal: &types.Principal{ID: "principal-1"}}
+}
+
+// TestCapabilityStageMissingCapability is the offline-mode half of the opt-in hole: a
+// holder of a narrowed capability could simply not present it and be minted a passport
+// with NO scope — unconstrained, hence wider than the capability it holds.
+func TestCapabilityStageMissingCapability(t *testing.T) {
+	rootPub, _ := rootKeys(t)
+
+	req := capRequest("", "")
+	if err := CapabilityStage(rootPub, WithRequireChain()).Handle(context.Background(), req); err == nil {
+		t.Fatal("a missing capability must fail closed in require mode")
+	}
+	if req.Scope.Tools != nil {
+		t.Fatalf("a rejected request must carry no scope: %v", req.Scope.Tools)
+	}
+
+	permissive := capRequest("", "")
+	if err := CapabilityStage(rootPub).Handle(context.Background(), permissive); err != nil {
+		t.Fatalf("absent capability should pass in permissive mode: %v", err)
+	}
+}
+
+func TestCapabilityStageRequireModeAcceptsPresentCapability(t *testing.T) {
+	rootPub, rootPriv := rootKeys(t)
+	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
+	enc, _ := EncodeCapability(cap)
+	proof := base64.RawURLEncoding.EncodeToString(HolderProof(s0, []byte(capTestToken)))
+
+	req := capRequest(enc, proof)
+	if err := CapabilityStage(rootPub, WithRequireChain()).Handle(context.Background(), req); err != nil {
+		t.Fatalf("a valid capability must still pass in require mode: %v", err)
+	}
+	if len(req.Scope.Tools) != 1 || req.Scope.Tools[0] != "read" {
+		t.Fatalf("scope not narrowed to the effective grant: %v", req.Scope.Tools)
+	}
 }
 
 func TestCapabilityEncodeDecode(t *testing.T) {

@@ -101,6 +101,7 @@ Gateway (full list in `cmd/gateway/main.go`):
 | `PASSPORT_PRINCIPAL_MODE` | `oidc` (default) or `vc` |
 | `PASSPORT_SIGNING_KEY` | base64url 32-byte seed (stable across replicas) |
 | `PASSPORT_WORKLOAD_CA` | base64url Ed25519 CA pubkey; enables instance auth + delegation |
+| `PASSPORT_ALLOW_DIRECT_PRINCIPAL` | `1` accepts requests carrying no delegation chain; by default (delegation enabled) they are rejected, so omitting the chain cannot escape its scope |
 | `PASSPORT_REVOCATION_DSN` | Postgres DSN for the shared kill-switch (empty = in-memory) |
 | `PASSPORT_REVOCATION_REFRESH` | cache refresh interval (default 2s) — keep well under your revocation SLA |
 | `PASSPORT_ALLOW_ALL` | `1` permits everything (**dev only**) |

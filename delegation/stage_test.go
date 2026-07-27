@@ -56,6 +56,35 @@ func TestStageNoChainPasses(t *testing.T) {
 	}
 }
 
+// TestStageRequireChainMissingFailsClosed covers the opt-in hole: with delegation optional
+// a delegate can omit its chain and be minted a passport with NO scope — unconstrained,
+// hence wider than the chain it holds. WithRequireChain must reject that.
+func TestStageRequireChainMissingFailsClosed(t *testing.T) {
+	noChain := func(*gateway.Request) (Chain, bool, error) { return Chain{}, false, nil }
+	req := &gateway.Request{Principal: &types.Principal{ID: "principal-1"}}
+	if err := Stage(MemKeyRegistry{}, noChain, WithRequireChain()).Handle(context.Background(), req); err == nil {
+		t.Fatal("a missing chain must fail closed in require mode")
+	}
+	if req.Scope.Tools != nil || req.Delegation != nil {
+		t.Fatalf("a rejected request must carry no scope or delegation: %+v", req)
+	}
+}
+
+func TestStageRequireChainAcceptsPresentChain(t *testing.T) {
+	principal := newParty(t, "principal-1")
+	a1 := newParty(t, "agent-1")
+	keys := registry(principal, a1)
+
+	chain, _ := NewRoot(principal.priv, principal.id, a1.id, Grant{Tools: []string{"read"}})
+	req := &gateway.Request{Principal: &types.Principal{ID: "principal-1"}}
+	if err := Stage(keys, staticChain(chain, nil), WithRequireChain()).Handle(context.Background(), req); err != nil {
+		t.Fatalf("a valid chain must still pass in require mode: %v", err)
+	}
+	if len(req.Scope.Tools) != 1 || req.Scope.Tools[0] != "read" {
+		t.Fatalf("scope not narrowed to delegated grant: %v", req.Scope.Tools)
+	}
+}
+
 func TestStageInvalidChainFailsClosed(t *testing.T) {
 	principal := newParty(t, "principal-1")
 	a1 := newParty(t, "agent-1")

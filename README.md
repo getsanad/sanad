@@ -81,6 +81,7 @@ make run
 #   PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey → enables instance auth + delegation
 #   PASSPORT_ALLOW_DIRECT_PRINCIPAL  1 = accept requests with no delegation chain (default: reject)
 #   PASSPORT_FORWARD_HEADERS     extra inbound headers forwarded upstream, comma-separated
+#   PASSPORT_MAX_REQUEST_BODY    bytes of MCP request body buffered per request (default 1 MiB)
 #   PASSPORT_DEV_NO_AUTH         1 = start without principal auth (dev only)
 
 # Admin control plane (set PASSPORT_ADMIN_TOKEN to require auth).

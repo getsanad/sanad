@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,12 +132,15 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 	}
 }
 
-// TestLiveDelegationBoundsThePolicyStage drives the same vertical with a policy stage that
-// actually extracts a tool — the FR-16 wiring the shipped gateway still passes nil for. The
-// policy stage used to ASSIGN types.Scope{Tools: []string{tool}}, so turning that wiring on
-// would have silently replaced the attenuated grant: a chain narrowed to [read] would mint a
-// passport for write. The requested tool must instead be intersected with the grant, and a
-// tool outside it denied outright.
+// TestLiveDelegationBoundsThePolicyStage drives the same vertical over REAL MCP traffic: a
+// streamable-HTTP POST whose JSON-RPC body names the tool, the gateway buffering and parsing
+// it, and policy.MCPTools handing it to the policy stage (FR-16).
+//
+// Two things are pinned at once. The policy stage used to ASSIGN types.Scope{Tools: {tool}},
+// so wiring a real extractor would have silently replaced the attenuated grant: a chain
+// narrowed to [read] would mint a passport for write. And buffering the body to see the tool
+// must not cost the upstream the body — an extractor that consumed the reader would forward
+// an empty POST and break every MCP call it authorized.
 //
 // Chain: principal -> agent-1 (read,write) -> agent-2 (read). agent-2 calls, so [read] binds.
 func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
@@ -174,8 +178,10 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 
 	signer, _ := sts.NewLocalSigner("kid-gw")
 	var forwarded string
+	var upstreamBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded = r.Header.Get("Authorization")
+		upstreamBody, _ = io.ReadAll(r.Body)
 		_, _ = io.WriteString(w, "ok")
 	}))
 	defer upstream.Close()
@@ -195,15 +201,12 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 		req.Principal = &types.Principal{ID: "principal-1"}
 		return nil
 	})
-	// The tool the caller asks for, taken from a header so the test can vary it. A real
-	// extractor parses the MCP JSON-RPC body (P2 item 10); the stage's contract is the same.
-	const toolHeader = "X-Test-Tool"
 	gatewayFor := func() *gateway.Gateway {
 		return &gateway.Gateway{Registry: reg, Pipeline: gateway.Pipeline{Stages: []gateway.Stage{
 			stubPrincipal,
 			workload.InstanceStage(caPub, store),
 			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation)),
-			policy.Stage(allowAll, func(req *gateway.Request) string { return req.HTTP.Header.Get(toolHeader) }, nil),
+			policy.Stage(allowAll, policy.MCPTools, nil),
 			sts.MintStage(sts.New(signer, sts.Config{Issuer: "sanad"})),
 		}}}
 	}
@@ -211,13 +214,17 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 	const principalToken = "principal-bearer-token"
 	credHdr, _ := workload.EncodeCredential(cred)
 	chainHdr, _ := delegation.EncodeChain(chain)
+	// A real MCP streamable-HTTP call: the tool is params.name in the POSTed JSON-RPC body.
+	callBody := func(tool string) string {
+		return `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"` + tool + `","arguments":{"path":"/etc/hosts"}}}`
+	}
 	send := func(tool string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil)
+		r := httptest.NewRequest(http.MethodPost, "/servers/demo/mcp", strings.NewReader(callBody(tool)))
 		r.Header.Set("Authorization", "Bearer "+principalToken)
+		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set(workload.HeaderCredential, credHdr)
 		r.Header.Set(workload.HeaderProof, workload.Proof(a2Priv, principalToken))
 		r.Header.Set(delegation.HeaderDelegation, chainHdr)
-		r.Header.Set(toolHeader, tool)
 		rec := httptest.NewRecorder()
 		gatewayFor().ServeHTTP(rec, r)
 		return rec
@@ -251,6 +258,11 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 	}
 	if claims.Budget == nil || claims.Budget.Limit != budget.Limit || claims.Budget.Unit != budget.Unit {
 		t.Fatalf("delegated budget dropped by the policy stage: %+v", claims.Budget)
+	}
+	// The body the decision was made from must also be the body the upstream executes:
+	// buffering it to read the tool cannot cost the call its arguments.
+	if string(upstreamBody) != callBody("read") {
+		t.Fatalf("upstream received body %q, want it forwarded intact: %q", upstreamBody, callBody("read"))
 	}
 }
 

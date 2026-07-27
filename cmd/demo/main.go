@@ -104,7 +104,7 @@ func main() {
 			workload.InstanceStage(caPub, store),
 			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation)),
 			revoke.Stage(ks),
-			policy.Stage(allowAll, nil, nil),
+			policy.Stage(allowAll, policy.MCPTools, nil),
 			sts.MintStage(sts.New(signer, sts.Config{Issuer: "sanad"})),
 		}},
 	}

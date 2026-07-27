@@ -10,8 +10,9 @@ import (
 	"github.com/getsanad/sanad/pkg/types"
 )
 
+// toolIs is a fixed extractor: one requested tool, i.e. one decision.
 func toolIs(name string) ToolExtractor {
-	return func(*gateway.Request) string { return name }
+	return func(*gateway.Request) []string { return []string{name} }
 }
 
 func authedReq(server string) *gateway.Request {

@@ -29,18 +29,27 @@ func NewHashChainLog(sink Sink) *HashChainLog {
 
 // Append records an entry, chaining it to the previous one, then streams it to the sink.
 func (l *HashChainLog) Append(_ context.Context, e Entry) error {
-	l.mu.Lock()
-	e.PrevHash = l.last
-	e.Hash = contentHash(l.last, e)
-	l.entries = append(l.entries, e)
-	l.last = e.Hash
-	sink := l.sink
-	l.mu.Unlock()
-
+	e, sink := l.commit(e)
 	if sink != nil {
 		return sink.Write(e)
 	}
 	return nil
+}
+
+// commit chains e onto the log under the lock and returns it exactly as stored (PrevHash
+// and Hash filled in) together with the sink it still has to be streamed to. Callers that
+// maintain a structure derived from the chain — the Merkle leaves in TransparencyLog — hold
+// their own lock across this call so their order is the chain's order, and never have to
+// re-read the tail to learn what they just appended. Streaming is left to the caller so it
+// keeps happening outside every lock.
+func (l *HashChainLog) commit(e Entry) (Entry, Sink) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e.PrevHash = l.last
+	e.Hash = contentHash(l.last, e)
+	l.entries = append(l.entries, e)
+	l.last = e.Hash
+	return e, l.sink
 }
 
 // Entries returns a copy of the recorded entries.

@@ -14,8 +14,9 @@ const serverPrefix = "/servers/"
 type AuditFunc func(req *Request, allowed bool, reason string)
 
 // Gateway is the enforcement point. It implements http.Handler: it resolves the target
-// protected server, runs the decision pipeline, and only on an explicit clean run
-// forwards the request upstream. Unknown servers and pipeline errors fail closed (NFR-3).
+// protected server, runs the decision pipeline, and forwards the request upstream only
+// on a clean run that minted a passport. Unknown servers, pipeline errors and a missing
+// passport all fail closed (NFR-3).
 type Gateway struct {
 	Registry *Registry
 	Pipeline Pipeline
@@ -63,6 +64,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := g.Pipeline.Run(r.Context(), req); err != nil {
 		// Any stage failure fails closed; the upstream is never contacted.
 		g.audit(req, false, err.Error())
+		http.Error(w, "denied", http.StatusForbidden)
+		return
+	}
+	if req.Passport == nil {
+		// A clean run is not enough: the upstream may only ever be reached with a minted
+		// passport (FR-8), so a pipeline that produced none — an empty or misconfigured
+		// one included — is a denial rather than a pass-through (NFR-3).
+		g.audit(req, false, "no passport minted")
 		http.Error(w, "denied", http.StatusForbidden)
 		return
 	}

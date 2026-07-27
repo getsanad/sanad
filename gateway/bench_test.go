@@ -8,7 +8,7 @@ import (
 )
 
 // BenchmarkProxyPassthrough isolates the gateway's routing + reverse-proxy overhead with
-// an empty pipeline and a local upstream.
+// a minimal (mint-only) pipeline and a local upstream.
 func BenchmarkProxyPassthrough(b *testing.B) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
@@ -16,7 +16,7 @@ func BenchmarkProxyPassthrough(b *testing.B) {
 	reg := NewRegistry()
 	u, _ := url.Parse(upstream.URL)
 	_ = reg.Register(&Server{ID: "demo", Upstream: u})
-	g := &Gateway{Registry: reg}
+	g := &Gateway{Registry: reg, Pipeline: Pipeline{Stages: []Stage{stubMint()}}}
 
 	b.ReportAllocs()
 	for b.Loop() {

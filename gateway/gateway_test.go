@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/getsanad/sanad/pkg/types"
 )
 
 func mustURL(t *testing.T, raw string) *url.URL {
@@ -17,6 +19,16 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatalf("parse %q: %v", raw, err)
 	}
 	return u
+}
+
+// stubMint stands in for the real mint stage (sts.MintStage, which cannot be imported
+// here without a cycle). Forwarding requires a minted passport, so any test that expects
+// the upstream to be reached needs this stage in its pipeline.
+func stubMint() Stage {
+	return NewStage("mint", func(ctx context.Context, r *Request) error {
+		r.Passport = &types.Passport{ID: "passport-1", Audience: r.Server}
+		return nil
+	})
 }
 
 func TestPipelineRunsInOrderAndStopsOnError(t *testing.T) {
@@ -73,6 +85,54 @@ func TestPipelineFailureFailsClosed(t *testing.T) {
 	}
 }
 
+// TestNoPassportMintedFailsClosed pins the structural invariant: a pipeline that runs
+// clean but mints nothing — an empty one being the worst case — must never turn the
+// gateway into an open reverse proxy (NFR-3, FR-8).
+func TestNoPassportMintedFailsClosed(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	reg := NewRegistry()
+	if err := reg.Register(&Server{ID: "demo", Upstream: mustURL(t, upstream.URL)}); err != nil {
+		t.Fatal(err)
+	}
+
+	pipelines := map[string]Pipeline{
+		"empty": {},
+		"stages that never mint": {Stages: []Stage{
+			NewStage("noop", func(ctx context.Context, r *Request) error { return nil }),
+		}},
+	}
+	for name, p := range pipelines {
+		t.Run(name, func(t *testing.T) {
+			var reason string
+			var allowed bool
+			g := &Gateway{
+				Registry: reg,
+				Pipeline: p,
+				Audit:    func(_ *Request, a bool, rs string) { allowed, reason = a, rs },
+			}
+
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil))
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("got %d, want 403", rec.Code)
+			}
+			if allowed || reason == "" {
+				t.Fatalf("denial must be audited, got allowed=%v reason=%q", allowed, reason)
+			}
+		})
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstream contacted %d times; it must never be reached without a passport", upstreamHits)
+	}
+}
+
 func TestProxiesToUpstreamWithStrippedPath(t *testing.T) {
 	var gotPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +145,7 @@ func TestProxiesToUpstreamWithStrippedPath(t *testing.T) {
 	if err := reg.Register(&Server{ID: "demo", Upstream: mustURL(t, upstream.URL)}); err != nil {
 		t.Fatal(err)
 	}
-	// Empty pipeline = allow; identity stages arrive in later issues.
-	g := &Gateway{Registry: reg}
+	g := &Gateway{Registry: reg, Pipeline: Pipeline{Stages: []Stage{stubMint()}}}
 
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil))

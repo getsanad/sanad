@@ -15,6 +15,7 @@ import (
 	"github.com/getsanad/sanad/gateway"
 	"github.com/getsanad/sanad/pkg/passport"
 	"github.com/getsanad/sanad/pkg/types"
+	"github.com/getsanad/sanad/policy"
 	"github.com/getsanad/sanad/sts"
 	"github.com/getsanad/sanad/workload"
 )
@@ -127,6 +128,129 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 	}
 	if len(claims.Tools) != 1 || claims.Tools[0] != "read" {
 		t.Fatalf("scope not attenuated to [read]: %v", claims.Tools)
+	}
+}
+
+// TestLiveDelegationBoundsThePolicyStage drives the same vertical with a policy stage that
+// actually extracts a tool — the FR-16 wiring the shipped gateway still passes nil for. The
+// policy stage used to ASSIGN types.Scope{Tools: []string{tool}}, so turning that wiring on
+// would have silently replaced the attenuated grant: a chain narrowed to [read] would mint a
+// passport for write. The requested tool must instead be intersected with the grant, and a
+// tool outside it denied outright.
+//
+// Chain: principal -> agent-1 (read,write) -> agent-2 (read). agent-2 calls, so [read] binds.
+func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
+	caPub, caPriv := key(t)
+	att := workload.NewTokenAttestor()
+	att.Register("boot-2", "agent-2")
+	authority, err := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	principalPub, principalPriv := key(t)
+	a1Pub, a1Priv := key(t)
+	a2Pub, a2Priv := key(t)
+
+	store := workload.NewKeyStore(caPub)
+	store.AddKey("principal-1", principalPub, time.Time{})
+	store.AddKey("agent-1", a1Pub, time.Now().Add(time.Hour))
+	cred, err := authority.Issue([]byte("boot-2"), a2Pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	budget := &types.Budget{Limit: 25, Unit: "usd"}
+	root, err := delegation.NewRoot(principalPriv, "principal-1", "agent-1", delegation.Grant{
+		Tools: []string{"read", "write"}, Budget: budget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := root.Extend(a1Priv, "agent-2", delegation.Grant{Tools: []string{"read"}, Budget: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, _ := sts.NewLocalSigner("kid-gw")
+	var forwarded string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	reg := gateway.NewRegistry()
+	u, _ := url.Parse(upstream.URL)
+	if err := reg.Register(&gateway.Server{ID: "demo", Upstream: u}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A permissive operator policy: the only thing standing between the caller and the tool
+	// it asked for is the delegation chain.
+	allowAll := policy.Func(func(_ context.Context, _ policy.Input) (types.Decision, error) {
+		return types.Decision{Effect: types.EffectAllow, Reason: "test allow-all"}, nil
+	})
+	stubPrincipal := gateway.NewStage("principal", func(_ context.Context, req *gateway.Request) error {
+		req.Principal = &types.Principal{ID: "principal-1"}
+		return nil
+	})
+	// The tool the caller asks for, taken from a header so the test can vary it. A real
+	// extractor parses the MCP JSON-RPC body (P2 item 10); the stage's contract is the same.
+	const toolHeader = "X-Test-Tool"
+	gatewayFor := func() *gateway.Gateway {
+		return &gateway.Gateway{Registry: reg, Pipeline: gateway.Pipeline{Stages: []gateway.Stage{
+			stubPrincipal,
+			workload.InstanceStage(caPub, store),
+			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation)),
+			policy.Stage(allowAll, func(req *gateway.Request) string { return req.HTTP.Header.Get(toolHeader) }, nil),
+			sts.MintStage(sts.New(signer, sts.Config{Issuer: "sanad"})),
+		}}}
+	}
+
+	const principalToken = "principal-bearer-token"
+	credHdr, _ := workload.EncodeCredential(cred)
+	chainHdr, _ := delegation.EncodeChain(chain)
+	send := func(tool string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil)
+		r.Header.Set("Authorization", "Bearer "+principalToken)
+		r.Header.Set(workload.HeaderCredential, credHdr)
+		r.Header.Set(workload.HeaderProof, workload.Proof(a2Priv, principalToken))
+		r.Header.Set(delegation.HeaderDelegation, chainHdr)
+		r.Header.Set(toolHeader, tool)
+		rec := httptest.NewRecorder()
+		gatewayFor().ServeHTTP(rec, r)
+		return rec
+	}
+
+	// "write" was given up at the agent-1 -> agent-2 hop: denied, and nothing forwarded.
+	forwarded = ""
+	if rec := send("write"); rec.Code != http.StatusForbidden {
+		t.Fatalf("a tool the chain gave up must be denied, got %d", rec.Code)
+	}
+	if forwarded != "" {
+		t.Fatalf("a denied request must never reach the upstream (forwarded %q)", forwarded)
+	}
+
+	// "read" is within the grant: allowed, and the passport is scoped to it — no broader
+	// than the chain — with the delegated budget intact.
+	rec := send("read")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a tool inside the chain should be allowed, got %d (%s)", rec.Code, rec.Body)
+	}
+	const prefix = "Bearer "
+	if len(forwarded) <= len(prefix) {
+		t.Fatalf("no passport forwarded: %q", forwarded)
+	}
+	claims, err := passport.Verify(signer.Public(), forwarded[len(prefix):], "demo", time.Now())
+	if err != nil {
+		t.Fatalf("forwarded passport invalid: %v", err)
+	}
+	if len(claims.Tools) != 1 || claims.Tools[0] != "read" {
+		t.Fatalf("passport scope = %v, want [read]", claims.Tools)
+	}
+	if claims.Budget == nil || claims.Budget.Limit != budget.Limit || claims.Budget.Unit != budget.Unit {
+		t.Fatalf("delegated budget dropped by the policy stage: %+v", claims.Budget)
 	}
 }
 

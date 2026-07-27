@@ -206,7 +206,9 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 		log.Print("instance auth + delegation enabled (PASSPORT_WORKLOAD_CA set)")
 	}
 
-	// Deny-by-default (FR-15). PASSPORT_ALLOW_ALL=1 permits everything for development.
+	// Deny-by-default (FR-15). PASSPORT_ALLOW_ALL=1 permits everything for development —
+	// everything the delegation allows, that is: the policy stage intersects its decision
+	// with the verified grant, so even allow-all cannot mint past a signed chain.
 	pdp := policy.DenyAll
 	if os.Getenv("PASSPORT_ALLOW_ALL") == "1" {
 		log.Print("PASSPORT_ALLOW_ALL=1: permitting all actions (development only)")

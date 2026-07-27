@@ -17,11 +17,25 @@ type Input struct {
 	Agent     *types.Agent
 	Server    string
 	Tool      string
-	// Delegation context is added in P2-04.
+	// DelegatedScope is the authority the request's delegation confers — the effective
+	// grant the delegation stage narrowed it to — with an empty Tools reading as
+	// unconstrained, exactly as attenuation reads it. Delegation is the verified chain
+	// behind it, nil both when the principal acts directly and in the offline capability
+	// mode (delegation.CapabilityStage), which carries a grant but no chain, so read the
+	// scope for authority and the chain for provenance.
+	//
+	// The stage already enforces the floor (Tool must be within DelegatedScope), so a PDP
+	// that ignores these stays safe; they are supplied so a policy engine can decide AGAINST
+	// the grant it is narrowing — route past a Budget to review, refuse a chain beyond some
+	// depth — which without them it could not see at all.
+	Delegation     *types.DelegationChain
+	DelegatedScope types.Scope
 }
 
 // PDP evaluates an Input and returns a decision. Implementations must be safe to call on
-// the hot path. An error is treated as deny (fail closed) by the gateway stage.
+// the hot path. An error is treated as deny (fail closed) by the gateway stage. An allow is
+// permission to mint, not authority to widen: the stage still intersects the decision with
+// Input.DelegatedScope, so no PDP can grant past the signed delegation chain.
 type PDP interface {
 	Evaluate(ctx context.Context, in Input) (types.Decision, error)
 }
@@ -40,6 +54,10 @@ var DenyAll PDP = Func(func(_ context.Context, _ Input) (types.Decision, error) 
 // AllowList is a per-server tool/action allowlist (FR-16). A request is allowed only if
 // its tool is listed for its server (or the server lists "*"); everything else is denied.
 // Tools marked via Review require human-in-the-loop approval and yield EffectReview.
+//
+// It is the operator's ceiling, deliberately independent of the delegation chain: the
+// stage has already rejected anything outside Input.DelegatedScope before this runs, so an
+// allowlist entry can only ever subtract from the delegated grant, never add to it.
 type AllowList struct {
 	allow  map[string]map[string]struct{}
 	review map[string]map[string]struct{}

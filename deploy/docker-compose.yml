@@ -1,0 +1,97 @@
+# Local Sanad stack for validation. Brings up the gateway (PEP), the enrollment
+# authority, the admin control plane, a shared Postgres kill-switch, and a demo upstream
+# ("protected MCP server"). It runs the REAL authenticated request path (VC principal +
+# workload-attested instance + optional delegation), so it is a faithful local mirror of a
+# production deployment — minus the KMS/attestation/mTLS seams, which are documented in
+# ../docs/DEPLOYMENT.md.
+#
+# Prereqs: run `go run ./cmd/devsecrets --out deploy` from the repo root first — it writes
+# deploy/.env (read below) and deploy/secrets/. Then, from this directory:
+#
+#     docker compose up --build
+#
+# DEV ONLY: PASSPORT_ALLOW_ALL=1 makes the policy engine permit every action so you can see
+# traffic flow; a real deployment removes it and configures policy.
+name: sanad
+
+x-image: &image
+  build:
+    context: ..
+    dockerfile: Dockerfile
+
+x-revocation-dsn: &revocation-dsn "postgres://passport:passport@postgres:5432/passport?sslmode=disable"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: passport
+      POSTGRES_PASSWORD: passport
+      POSTGRES_DB: passport
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U passport -d passport"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  authority:
+    <<: *image
+    command: ["/usr/local/bin/authority"]
+    environment:
+      PASSPORT_AUTHORITY_ADDR: ":8082"
+      PASSPORT_CA_KEY: ${PASSPORT_CA_KEY:?run "go run ./cmd/devsecrets --out deploy" first}
+      PASSPORT_BOOTSTRAP_TOKENS: ${PASSPORT_BOOTSTRAP_TOKENS:?missing - regenerate deploy/.env}
+      PASSPORT_CREDENTIAL_TTL: "1h"
+    ports:
+      - "8082:8082"
+
+  echomcp:
+    <<: *image
+    command: ["/usr/local/bin/echomcp"]
+    environment:
+      ADDR: ":9090"
+
+  gateway:
+    <<: *image
+    command: ["/usr/local/bin/gateway"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authority:
+        condition: service_started
+      echomcp:
+        condition: service_started
+    environment:
+      PASSPORT_GATEWAY_ADDR: ":8080"
+      PASSPORT_SERVERS: "demo=http://echomcp:9090"
+      PASSPORT_PRINCIPAL_MODE: "vc"
+      PASSPORT_VC_TRUSTED_ISSUERS: ${PASSPORT_VC_TRUSTED_ISSUERS:?missing - regenerate deploy/.env}
+      PASSPORT_WORKLOAD_CA: ${PASSPORT_WORKLOAD_CA:?missing - regenerate deploy/.env}
+      PASSPORT_SIGNING_KEY: ${PASSPORT_SIGNING_KEY:?missing - regenerate deploy/.env}
+      PASSPORT_SIGNING_KID: "gateway-dev"
+      PASSPORT_ISSUER_NAME: "sanad"
+      PASSPORT_ALLOW_ALL: "1"
+      PASSPORT_REVOCATION_DSN: *revocation-dsn
+      PASSPORT_REVOCATION_REFRESH: "2s"
+    ports:
+      - "8080:8080"
+
+  admin:
+    <<: *image
+    command: ["/usr/local/bin/admin"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PASSPORT_ADMIN_ADDR: ":8081"
+      PASSPORT_ADMIN_TOKEN: ${PASSPORT_ADMIN_TOKEN:?missing - regenerate deploy/.env}
+      PASSPORT_REVOCATION_DSN: *revocation-dsn
+    ports:
+      - "8081:8081"
+
+volumes:
+  pgdata:

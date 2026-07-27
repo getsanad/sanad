@@ -29,7 +29,9 @@ type Grant struct {
 	Budget   *types.Budget
 }
 
-// Scope projects the grant onto the passport scope (tools + budget).
+// Scope projects the grant onto the passport scope (tools + budget). Servers is not part of
+// the passport scope: it constrains which server may be called at all, and is enforced
+// against the request target by the delegation stage (checkServer).
 func (g Grant) Scope() types.Scope {
 	return types.Scope{Tools: g.Tools, Budget: g.Budget}
 }

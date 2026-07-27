@@ -69,6 +69,9 @@ func Stage(keys KeyRegistry, extract ChainExtractor, opts ...StageOption) gatewa
 		if req.Agent != nil && req.Agent.ID != actingAgent {
 			return fmt.Errorf("delegation: chain ends at %q but the authenticated instance is %q", actingAgent, req.Agent.ID)
 		}
+		if err := checkServer(grant, req); err != nil {
+			return err // fail closed
+		}
 		req.Scope = grant.Scope()
 		req.Delegation = chain.ToTypes()
 		if req.Agent == nil {
@@ -76,4 +79,34 @@ func Stage(keys KeyRegistry, extract ChainExtractor, opts ...StageOption) gatewa
 		}
 		return nil
 	})
+}
+
+// checkServer binds the effective grant's Servers constraint to the server the request is
+// actually headed for. Grant.Scope() projects only tools+budget, so without this the server
+// constraint — signed by the principal, transported and attenuation-checked — would never
+// reach a decision, and a chain granting only "reports" would authorize "payments".
+//
+// The semantics are the ones subset (attenuation.go) already validated every hop against:
+// an EMPTY list is the wildcard "any server", and entries are matched literally. A grant has
+// no "*" wildcard — attenuates treats "*" as an ordinary server id — so a literal "*" here
+// matches only a server registered under that id.
+func checkServer(g Grant, req *gateway.Request) error {
+	if len(g.Servers) == 0 {
+		return nil // unconstrained, as attenuation reads it
+	}
+	// Target is the resolved server the gateway will proxy to, so it is what must be
+	// checked; req.Server is the id it was resolved from, for pipelines wired by hand.
+	target := req.Server
+	if req.Target != nil {
+		target = req.Target.ID
+	}
+	if target == "" {
+		return errors.New("delegation: the delegation is limited to named servers but the request has no target server")
+	}
+	for _, s := range g.Servers {
+		if s == target {
+			return nil
+		}
+	}
+	return fmt.Errorf("delegation: the delegation grants servers %v but the request targets %q", g.Servers, target)
 }

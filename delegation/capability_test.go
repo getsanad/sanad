@@ -177,6 +177,48 @@ func TestCapabilityStageRequireModeAcceptsPresentCapability(t *testing.T) {
 	}
 }
 
+// TestCapabilityStageEnforcesGrantServers is the offline-mode half of the server-constraint
+// gap: the capability's Servers list must bind to the server actually being called.
+func TestCapabilityStageEnforcesGrantServers(t *testing.T) {
+	rootPub, rootPriv := rootKeys(t)
+	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}, Servers: []string{"readonly-reports"}})
+	enc, _ := EncodeCapability(cap)
+	proof := base64.RawURLEncoding.EncodeToString(HolderProof(s0, []byte(capTestToken)))
+
+	denied := capRequest(enc, proof)
+	denied.Server = "payments"
+	if err := CapabilityStage(rootPub).Handle(context.Background(), denied); err == nil {
+		t.Fatal("a capability granting readonly-reports must not authorize payments")
+	}
+	if denied.Scope.Tools != nil {
+		t.Fatalf("a rejected request must carry no scope: %v", denied.Scope.Tools)
+	}
+
+	allowed := capRequest(enc, proof)
+	allowed.Server = "readonly-reports"
+	if err := CapabilityStage(rootPub).Handle(context.Background(), allowed); err != nil {
+		t.Fatalf("the granted server must be allowed: %v", err)
+	}
+	if len(allowed.Scope.Tools) != 1 || allowed.Scope.Tools[0] != "read" {
+		t.Fatalf("scope not narrowed to the effective grant: %v", allowed.Scope.Tools)
+	}
+}
+
+// TestCapabilityStageEmptyServersIsAnyServer: an unconstrained list stays unconstrained,
+// exactly as attenuation reads it.
+func TestCapabilityStageEmptyServersIsAnyServer(t *testing.T) {
+	rootPub, rootPriv := rootKeys(t)
+	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
+	enc, _ := EncodeCapability(cap)
+	proof := base64.RawURLEncoding.EncodeToString(HolderProof(s0, []byte(capTestToken)))
+
+	req := capRequest(enc, proof)
+	req.Server = "payments"
+	if err := CapabilityStage(rootPub).Handle(context.Background(), req); err != nil {
+		t.Fatalf("a capability with no server constraint must reach any server: %v", err)
+	}
+}
+
 func TestCapabilityEncodeDecode(t *testing.T) {
 	rootPub, rootPriv := rootKeys(t)
 	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read", "write"}})

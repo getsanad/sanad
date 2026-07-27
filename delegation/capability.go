@@ -184,6 +184,9 @@ func CapabilityStage(rootPub ed25519.PublicKey, opts ...StageOption) gateway.Sta
 		if token == "" || !c.VerifyHolder([]byte(token), proof) {
 			return errors.New("delegation: capability holder proof failed")
 		}
+		if err := checkServer(grant, req); err != nil {
+			return err // fail closed
+		}
 		req.Scope = grant.Scope()
 		return nil
 	})

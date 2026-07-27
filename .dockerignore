@@ -1,0 +1,17 @@
+# Keep the build context small: only Go source + modules are needed.
+.git
+.gitignore
+.github
+.codegraph
+.commandcode
+deploy
+sdks
+gtm
+issues
+docs
+*.md
+Sanad-*.md
+demo
+bin
+*.test
+*.out

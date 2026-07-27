@@ -1,0 +1,43 @@
+{
+  "name": "@getsanad/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript/Node client SDK for Sanad — enroll for a workload credential and attach passport auth headers to gateway (MCP) requests. Mirrors the `passport proxy` sidecar.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node --test 'test/**/*.test.ts'",
+    "test:vectors": "node test/vectors.mjs",
+    "test:strict": "npm run typecheck && node --test 'test/**/*.test.ts'",
+    "example": "node examples/quickstart.ts"
+  },
+  "keywords": [
+    "sanad",
+    "mcp",
+    "ed25519",
+    "workload-identity",
+    "gateway",
+    "authentication"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

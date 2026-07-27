@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sanad-sdk"
+version = "0.1.0"
+description = "Python client SDK for Sanad — enroll and authenticate AI agents to the gateway."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sanad" }]
+keywords = ["agent", "passport", "mcp", "ed25519", "authentication"]
+dependencies = [
+    "cryptography>=3.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/getsanad/sanad"
+Source = "https://github.com/getsanad/sanad/tree/main/sdks/python"
+
+[tool.setuptools]
+packages = ["sanad"]

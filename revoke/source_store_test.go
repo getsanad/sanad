@@ -8,8 +8,8 @@ import (
 // failSource is a Source whose writes fail, to prove SyncStore surfaces errors.
 type failSource struct{ err error }
 
-func (f failSource) Revoke(string) error   { return f.err }
-func (f failSource) Restore(string) error  { return f.err }
+func (f failSource) Revoke(string) error     { return f.err }
+func (f failSource) Restore(string) error    { return f.err }
 func (f failSource) List() ([]string, error) { return nil, f.err }
 
 func TestSyncStoreOverMemSource(t *testing.T) {

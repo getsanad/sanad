@@ -21,6 +21,13 @@ type Gateway struct {
 	Registry *Registry
 	Pipeline Pipeline
 	Audit    AuditFunc // optional
+	// Ready is an optional readiness check reported on /readyz. It is for dependencies whose
+	// failure makes this replica unfit to serve even though the process is alive — chiefly a
+	// kill-switch snapshot that has gone stale (NFR-4). Returning an error takes the replica
+	// out of the load balancer, which is the same direction as the request-path denial: no
+	// traffic is better than traffic decided on state we can no longer vouch for. nil means
+	// "ready as long as the gateway is wired".
+	Ready func() error
 }
 
 func (g *Gateway) audit(req *Request, allowed bool, reason string) {
@@ -40,6 +47,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if g.Registry == nil {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
+		}
+		if g.Ready != nil {
+			if err := g.Ready(); err != nil {
+				// The reason names the failing dependency and its age, not any identity, so
+				// it is safe to return and is what an operator needs from a probe.
+				http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))

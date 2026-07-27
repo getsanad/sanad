@@ -17,6 +17,7 @@
 //	PASSPORT_SIGNING_KID         signing key id (default gateway-dev)
 //	PASSPORT_REVOCATION_DSN      Postgres DSN for a shared kill-switch (empty = in-memory)
 //	PASSPORT_REVOCATION_REFRESH  cache refresh interval for the shared kill-switch (default 2s)
+//	PASSPORT_REVOCATION_MAX_STALENESS  snapshot age past which revocation checks deny (default 60s)
 //	PASSPORT_DEV_NO_AUTH         1 = start without principal auth (development only)
 //
 // With no principal authenticator configured startup is a fatal error unless
@@ -71,7 +72,7 @@ func main() {
 		log.Fatalf("gateway: signer: %v", err)
 	}
 
-	pipeline, err := buildPipeline(context.Background(), signer)
+	pipeline, killSwitch, err := buildPipeline(context.Background(), signer)
 	if err != nil {
 		log.Fatalf("gateway: pipeline: %v", err)
 	}
@@ -80,10 +81,26 @@ func main() {
 	// (stand-in for a SIEM endpoint, P1-08).
 	auditLog := audit.NewHashChainLog(audit.NewJSONLinesSink(os.Stdout))
 
-	g := &gateway.Gateway{Registry: reg, Pipeline: pipeline, Audit: audit.GatewayHook(auditLog)}
+	// A kill-switch snapshot older than its bound means revocations may not be reaching this
+	// replica, so it reports unready and gets pulled from the load balancer — matching the
+	// request-path denial in revoke.Stage rather than quietly serving stale decisions (NFR-4).
+	g := &gateway.Gateway{
+		Registry: reg,
+		Pipeline: pipeline,
+		Audit:    audit.GatewayHook(auditLog),
+		Ready:    killSwitch.CheckFresh,
+	}
 
 	// Expose metrics at /metrics and instrument all gateway traffic (P1-11).
 	reg2 := metrics.NewRegistry()
+	// Snapshot age is the observable form of the revocation window: alert on it approaching
+	// the staleness bound and an outage is visible long before it becomes a denial.
+	reg2.SetGauge("agentpassport_revocation_snapshot_age_seconds",
+		"Seconds since the kill-switch snapshot was last successfully refreshed from its source.",
+		func() float64 { return killSwitch.Staleness().Seconds() })
+	reg2.SetGauge("agentpassport_revocation_max_staleness_seconds",
+		"Snapshot age at which revocation checks start denying (0 = no bound configured).",
+		func() float64 { return killSwitch.MaxStaleness().Seconds() })
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg2.Handler())
 	mux.Handle("/.well-known/jwks.json", jwks.Handler(jwks.Key{Kid: signer.KeyID(), Pub: signer.Public()}))
@@ -119,15 +136,16 @@ func registerServers(reg *gateway.Registry, spec string) error {
 	return nil
 }
 
-// buildPipeline assembles the decision pipeline from configuration.
-func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, error) {
+// buildPipeline assembles the decision pipeline from configuration. It also returns the
+// kill-switch it wired, so main can surface its snapshot age on /readyz and /metrics.
+func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *revoke.CachedStore, error) {
 	// One kill-switch enforced at both authentication and mint time (P1-07). Reads are
 	// served from a local snapshot (hot path never makes a DB call, FR-20); when a shared
 	// Postgres source is configured the snapshot refreshes so revocations propagate across
 	// replicas (NFR-2).
 	ks, err := buildKillSwitch()
 	if err != nil {
-		return gateway.Pipeline{}, err
+		return gateway.Pipeline{}, nil, err
 	}
 
 	// Optional workload identity. Its key store also lets the VC principal authenticator
@@ -137,7 +155,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 	if caB64 := os.Getenv("PASSPORT_WORKLOAD_CA"); caB64 != "" {
 		pub, derr := base64.RawURLEncoding.DecodeString(caB64)
 		if derr != nil || len(pub) != ed25519.PublicKeySize {
-			return gateway.Pipeline{}, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
+			return gateway.Pipeline{}, nil, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
 		}
 		caPub = ed25519.PublicKey(pub)
 		store = workload.NewKeyStore(caPub)
@@ -145,7 +163,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 
 	auth, err := buildPrincipalAuth(ctx, ks, store)
 	if err != nil {
-		return gateway.Pipeline{}, err
+		return gateway.Pipeline{}, nil, err
 	}
 	// Never serve unauthenticated by accident. A pipeline with no principal stage mints no
 	// passport, so the gateway denies every proxied request (gateway/proxy.go) while looking
@@ -157,11 +175,11 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 			if os.Getenv("PASSPORT_PRINCIPAL_MODE") == "vc" {
 				need = "PASSPORT_VC_TRUSTED_ISSUERS"
 			}
-			return gateway.Pipeline{}, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
+			return gateway.Pipeline{}, nil, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
 				envOr("PASSPORT_PRINCIPAL_MODE", "oidc"), need)
 		}
 		log.Print("WARNING: PASSPORT_DEV_NO_AUTH=1: no principal authentication configured; every proxied request will be denied (development only)")
-		return gateway.Pipeline{}, nil
+		return gateway.Pipeline{}, ks, nil
 	}
 
 	// Order: principal -> [instance -> delegation] -> revoke -> policy -> mint. Revoke runs
@@ -208,7 +226,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 	mint := sts.MintStage(sts.New(signer, sts.Config{Issuer: envOr("PASSPORT_ISSUER_NAME", "sanad")}), mopts...)
 
 	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, nil, nil), mint)
-	return gateway.Pipeline{Stages: stages}, nil
+	return gateway.Pipeline{Stages: stages}, ks, nil
 }
 
 // buildPrincipalAuth selects the principal authenticator by PASSPORT_PRINCIPAL_MODE
@@ -294,11 +312,24 @@ func loadSigner() (*sts.LocalSigner, error) {
 // PASSPORT_REVOCATION_DSN set the snapshot is backed by a shared Postgres source and
 // refreshed periodically, so a revocation written by the admin plane or another replica
 // propagates to every gateway (NFR-2); without it the source is in-process (single node).
+//
+// The shared-source snapshot also carries a staleness bound (PASSPORT_REVOCATION_MAX_STALENESS,
+// default revoke.DefaultMaxStaleness): once refreshes have been failing for longer than that,
+// this replica can no longer promise NFR-4 and starts denying instead of serving a snapshot
+// of unbounded age. The in-memory source has nothing to fall out of sync with, so it has no
+// bound.
 func buildKillSwitch() (*revoke.CachedStore, error) {
 	dsn := os.Getenv("PASSPORT_REVOCATION_DSN")
 	if dsn == "" {
 		log.Print("kill-switch: in-memory (set PASSPORT_REVOCATION_DSN for a shared Postgres kill-switch across replicas)")
 		return revoke.NewCachedStore(revoke.NewMemSource(), 0)
+	}
+
+	// Validate the timings before dialling: a bad duration should fail immediately, not
+	// after a database round-trip.
+	refresh, maxStale, err := revocationTiming()
+	if err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("pgx", dsn)
@@ -315,14 +346,37 @@ func buildKillSwitch() (*revoke.CachedStore, error) {
 		return nil, err
 	}
 
-	refresh := 2 * time.Second
+	if maxStale <= 0 {
+		log.Print("WARNING: PASSPORT_REVOCATION_MAX_STALENESS disables the staleness bound; if the revocation source becomes unreachable this replica will serve its last snapshot indefinitely")
+	}
+	log.Printf("kill-switch: shared Postgres source, snapshot refresh every %s, denying past %s of staleness", refresh, maxStale)
+	return revoke.NewCachedStore(src, refresh, revoke.WithMaxStaleness(maxStale))
+}
+
+// revocationTiming reads the shared kill-switch's refresh interval and staleness bound.
+// The bound must exceed the refresh interval: at or under it a single missed tick denies
+// every request, which is a self-inflicted outage rather than a safety property, so that
+// configuration is rejected at startup instead of discovered in production.
+func revocationTiming() (refresh, maxStale time.Duration, err error) {
+	refresh = 2 * time.Second
 	if v := os.Getenv("PASSPORT_REVOCATION_REFRESH"); v != "" {
 		d, perr := time.ParseDuration(v)
 		if perr != nil {
-			return nil, fmt.Errorf("PASSPORT_REVOCATION_REFRESH: %w", perr)
+			return 0, 0, fmt.Errorf("PASSPORT_REVOCATION_REFRESH: %w", perr)
 		}
 		refresh = d
 	}
-	log.Printf("kill-switch: shared Postgres source, snapshot refresh every %s", refresh)
-	return revoke.NewCachedStore(src, refresh)
+
+	maxStale = revoke.DefaultMaxStaleness
+	if v := os.Getenv("PASSPORT_REVOCATION_MAX_STALENESS"); v != "" {
+		d, perr := time.ParseDuration(v)
+		if perr != nil {
+			return 0, 0, fmt.Errorf("PASSPORT_REVOCATION_MAX_STALENESS: %w", perr)
+		}
+		maxStale = d
+	}
+	if maxStale > 0 && maxStale <= refresh {
+		return 0, 0, fmt.Errorf("PASSPORT_REVOCATION_MAX_STALENESS (%s) must be greater than PASSPORT_REVOCATION_REFRESH (%s)", maxStale, refresh)
+	}
+	return refresh, maxStale, nil
 }

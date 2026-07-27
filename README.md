@@ -80,6 +80,7 @@ make run
 #   PASSPORT_VC_TRUSTED_ISSUERS  comma-separated trusted issuer DIDs (vc mode)
 #   PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey → enables instance auth + delegation
 #   PASSPORT_ALLOW_DIRECT_PRINCIPAL  1 = accept requests with no delegation chain (default: reject)
+#   PASSPORT_FORWARD_HEADERS     extra inbound headers forwarded upstream, comma-separated
 #   PASSPORT_DEV_NO_AUTH         1 = start without principal auth (dev only)
 
 # Admin control plane (set PASSPORT_ADMIN_TOKEN to require auth).
@@ -124,10 +125,12 @@ Postgres. Full walkthrough and the ECS/production shape: [`docs/DEPLOYMENT.md`](
 An agent reaches a protected server by calling the gateway with three things on the
 request: the **principal credential** (`Authorization: Bearer …`), its **workload
 credential** + proof (`X-Agent-Credential` / `X-Agent-Proof`), and its **delegation chain**
-(`X-Agent-Delegation`). The gateway authenticates, mints a passport, strips the caller's
-credential, and forwards. Once delegation is enabled a request with no chain is rejected —
-omitting it must not be a way to escape the chain's scope — unless the deployment sets
-`PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act directly.
+(`X-Agent-Delegation`). The gateway authenticates, mints a passport, and forwards only that
+passport plus a minimal transport allowlist — every other inbound header (those credentials,
+cookies, API keys) is dropped, so a semi-trusted MCP server gets nothing it could replay
+(`PASSPORT_FORWARD_HEADERS` widens the allowlist). Once delegation is enabled a request with
+no chain is rejected — omitting it must not be a way to escape the chain's scope — unless
+the deployment sets `PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act directly.
 
 - **Easiest (any language, zero code changes): enroll once, then run the `passport` sidecar.**
   The agent points its MCP client at a local proxy that injects all the credentials for it:

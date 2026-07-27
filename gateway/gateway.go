@@ -15,9 +15,18 @@ import (
 // Request is the in-flight, identity-enriched request moving through the pipeline.
 // Successive stages populate its identity fields (principal auth, policy, mint).
 type Request struct {
-	Server     string                 // target protected MCP server ID
-	Target     *Server                // resolved server (nil if unknown)
-	HTTP       *http.Request          // the inbound request stages may inspect
+	Server string        // target protected MCP server ID
+	Target *Server       // resolved server (nil if unknown)
+	HTTP   *http.Request // the inbound request stages may inspect
+	// Body is the buffered request body, read once by the gateway and put back for the
+	// reverse proxy (nil when the request carried none). Stages must read it instead of
+	// HTTP.Body, which is a one-shot reader they would consume out from under the upstream.
+	Body []byte
+	// Calls are the JSON-RPC messages parsed out of Body: one for a single MCP call, one per
+	// element for a batch, none for a request that is not JSON-RPC. This is where the tool
+	// being invoked becomes visible to a decision (FR-16) — in MCP streamable HTTP it is in
+	// the body, not the URL.
+	Calls      []RPCCall
 	Principal  *types.Principal       // set by the principal-auth stage (P1-03)
 	Agent      *types.Agent           // set by instance auth (P2-02) or delegation (P2-04)
 	Decision   *types.Decision        // set by the policy stage (P1-06)

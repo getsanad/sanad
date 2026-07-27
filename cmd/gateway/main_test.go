@@ -137,6 +137,99 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 	})
 }
 
+// TestBuildPipelineWiresTheToolExtractor: the shipped gateway used to pass a nil extractor,
+// so every request reached the PDP with an empty tool and every passport shipped an empty
+// scope — per-tool authorization (FR-16) was unreachable. With policy.MCPTools wired, the
+// tool inside the MCP JSON-RPC body reaches the decision, and the attenuation floor the
+// policy stage enforces becomes live: a tool the delegation gave up is denied even under
+// PASSPORT_ALLOW_ALL, which is exactly what a nil extractor could not do.
+func TestBuildPipelineWiresTheToolExtractor(t *testing.T) {
+	signer, err := sts.NewLocalSigner("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearAuthEnv(t)
+	t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
+	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
+	t.Setenv("PASSPORT_ALLOW_ALL", "1") // the PDP permits everything: only attenuation can deny
+
+	p, _, err := buildPipeline(context.Background(), signer)
+	if err != nil {
+		t.Fatalf("buildPipeline: %v", err)
+	}
+	var stage gateway.Stage
+	for _, s := range p.Stages {
+		if s.Name() == "policy" {
+			stage = s
+		}
+	}
+	if stage == nil {
+		t.Fatal("configured pipeline has no policy stage")
+	}
+
+	// A request already narrowed to [read] by delegation, asking for admin_delete in its body.
+	call := func(tool string) *gateway.Request {
+		return &gateway.Request{
+			Server:    "demo",
+			HTTP:      httptest.NewRequest(http.MethodPost, "/servers/demo/mcp", nil),
+			Principal: &types.Principal{ID: "principal-1"},
+			Scope:     types.Scope{Tools: []string{"read"}},
+			Calls:     []gateway.RPCCall{{Method: "tools/call", Tool: tool}},
+		}
+	}
+	if err := stage.Handle(context.Background(), call("admin_delete")); err == nil {
+		t.Fatal("a tool outside the delegated scope must be denied; the extractor is not wired")
+	}
+
+	granted := call("read")
+	if err := stage.Handle(context.Background(), granted); err != nil {
+		t.Fatalf("a tool inside the delegated scope should pass: %v", err)
+	}
+	if len(granted.Scope.Tools) != 1 || granted.Scope.Tools[0] != "read" {
+		t.Fatalf("granted scope = %v, want [read]", granted.Scope.Tools)
+	}
+}
+
+// TestMaxRequestBody covers the buffered-body cap: unset means the gateway's own default, and
+// a value an operator got wrong is a startup error rather than a silent fallback to it.
+func TestMaxRequestBody(t *testing.T) {
+	cases := []struct {
+		env     string
+		want    int64
+		wantErr bool
+	}{
+		{env: "", want: 0}, // 0 = "unset": gateway.DefaultMaxRequestBody applies
+		{env: "4194304", want: 4 << 20},
+		{env: " 2048 ", want: 2048},
+		{env: "0", wantErr: true}, // not an "unlimited" switch
+		{env: "-1", wantErr: true},
+		{env: "1MiB", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run("PASSPORT_MAX_REQUEST_BODY="+tc.env, func(t *testing.T) {
+			t.Setenv("PASSPORT_MAX_REQUEST_BODY", tc.env)
+			got, err := maxRequestBody()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// Unset must land on the documented default once the gateway applies it.
+	if (&gateway.Gateway{MaxRequestBody: 0}).MaxRequestBody != 0 || gateway.DefaultMaxRequestBody != 1<<20 {
+		t.Fatalf("default request-body cap changed: %d", gateway.DefaultMaxRequestBody)
+	}
+}
+
 // TestRevocationTiming covers the shared kill-switch's staleness configuration: the NFR-4
 // bound is the default, and a bound that would deny on a single missed refresh is rejected
 // at startup rather than silently turning the gateway into a coin flip.

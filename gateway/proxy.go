@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -28,6 +29,18 @@ type Gateway struct {
 	// traffic is better than traffic decided on state we can no longer vouch for. nil means
 	// "ready as long as the gateway is wired".
 	Ready func() error
+	// MaxRequestBody caps the request body buffered for the decision pipeline. Zero (or a
+	// negative value, which is a misconfiguration) selects DefaultMaxRequestBody; there is
+	// deliberately no "unlimited" setting, because the buffer is filled before the caller has
+	// been authenticated.
+	MaxRequestBody int64
+}
+
+func (g *Gateway) maxRequestBody() int64 {
+	if g.MaxRequestBody > 0 {
+		return g.MaxRequestBody
+	}
+	return DefaultMaxRequestBody
 }
 
 func (g *Gateway) audit(req *Request, allowed bool, reason string) {
@@ -76,6 +89,35 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := &Request{Server: id, Target: srv, HTTP: r}
+
+	// Read the MCP request body BEFORE the pipeline runs. The tool being invoked lives in the
+	// JSON-RPC body, so a policy stage that has not seen it cannot authorize per tool (FR-16),
+	// and a tool extractor that read HTTP.Body itself would drain the one-shot reader and leave
+	// the reverse proxy forwarding an empty body upstream.
+	if hasRequestBody(r) {
+		body, err := bufferRequestBody(w, r, g.maxRequestBody())
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			g.audit(req, false, err.Error())
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+		req.Body = body
+
+		calls, err := parseRPC(body)
+		if err != nil {
+			// A body that says it is calling a tool but does not name one is refused rather
+			// than forwarded on an authorization nobody could have made (NFR-3).
+			g.audit(req, false, "malformed JSON-RPC: "+err.Error())
+			http.Error(w, "malformed JSON-RPC request", http.StatusBadRequest)
+			return
+		}
+		req.Calls = calls
+	}
+
 	if err := g.Pipeline.Run(r.Context(), req); err != nil {
 		// Any stage failure fails closed; the upstream is never contacted.
 		g.audit(req, false, err.Error())

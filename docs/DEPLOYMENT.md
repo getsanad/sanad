@@ -103,6 +103,7 @@ Gateway (full list in `cmd/gateway/main.go`):
 | `PASSPORT_WORKLOAD_CA` | base64url Ed25519 CA pubkey; enables instance auth + delegation |
 | `PASSPORT_ALLOW_DIRECT_PRINCIPAL` | `1` accepts requests carrying no delegation chain; by default (delegation enabled) they are rejected, so omitting the chain cannot escape its scope |
 | `PASSPORT_FORWARD_HEADERS` | comma-separated extra inbound headers to forward upstream; by default only the minted passport plus a minimal MCP transport set survives (token isolation, FR-8) |
+| `PASSPORT_MAX_REQUEST_BODY` | bytes of MCP request body buffered so the tool being called can be authorized (default 1 MiB); a larger body is refused with `413` rather than forwarded undecided |
 | `PASSPORT_REVOCATION_DSN` | Postgres DSN for the shared kill-switch (empty = in-memory) |
 | `PASSPORT_REVOCATION_REFRESH` | cache refresh interval (default 2s) — keep well under your revocation SLA |
 | `PASSPORT_REVOCATION_MAX_STALENESS` | snapshot age past which revocation checks **deny** and `/readyz` reports unready (default 60s, the NFR-4 target); must exceed the refresh interval |

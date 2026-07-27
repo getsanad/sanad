@@ -13,6 +13,7 @@
 //	PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey; enables instance auth + delegation
 //	PASSPORT_ALLOW_DIRECT_PRINCIPAL  1 = accept requests with no delegation chain (default: reject)
 //	PASSPORT_FORWARD_HEADERS     extra inbound headers forwarded upstream, comma-separated
+//	PASSPORT_MAX_REQUEST_BODY    bytes of request body buffered for the decision (default 1 MiB)
 //	PASSPORT_ISSUER_NAME         `iss` placed on minted passports (default sanad)
 //	PASSPORT_SIGNING_KID         signing key id (default gateway-dev)
 //	PASSPORT_REVOCATION_DSN      Postgres DSN for a shared kill-switch (empty = in-memory)
@@ -37,6 +38,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +79,11 @@ func main() {
 		log.Fatalf("gateway: pipeline: %v", err)
 	}
 
+	maxBody, err := maxRequestBody()
+	if err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+
 	// Audit every decision to a tamper-evident log, streamed as JSON lines to stdout
 	// (stand-in for a SIEM endpoint, P1-08).
 	auditLog := audit.NewHashChainLog(audit.NewJSONLinesSink(os.Stdout))
@@ -85,10 +92,11 @@ func main() {
 	// replica, so it reports unready and gets pulled from the load balancer — matching the
 	// request-path denial in revoke.Stage rather than quietly serving stale decisions (NFR-4).
 	g := &gateway.Gateway{
-		Registry: reg,
-		Pipeline: pipeline,
-		Audit:    audit.GatewayHook(auditLog),
-		Ready:    killSwitch.CheckFresh,
+		Registry:       reg,
+		Pipeline:       pipeline,
+		Audit:          audit.GatewayHook(auditLog),
+		Ready:          killSwitch.CheckFresh,
+		MaxRequestBody: maxBody,
 	}
 
 	// Expose metrics at /metrics and instrument all gateway traffic (P1-11).
@@ -227,7 +235,12 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 	}
 	mint := sts.MintStage(sts.New(signer, sts.Config{Issuer: envOr("PASSPORT_ISSUER_NAME", "sanad")}), mopts...)
 
-	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, nil, nil), mint)
+	// policy.MCPTools is the real tool extractor: the gateway buffers the JSON-RPC body and
+	// parses it, so the tool a tools/call names reaches the decision (FR-16) instead of the
+	// nil extractor's empty tool. Turning it on makes attenuation live — the stage intersects
+	// the requested tool with the delegated grant and denies anything outside it — which is
+	// why it lands together with the buffering rather than before it.
+	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, policy.MCPTools, nil), mint)
 	return gateway.Pipeline{Stages: stages}, ks, nil
 }
 
@@ -284,6 +297,25 @@ func headerNames(spec string) []string {
 		}
 	}
 	return out
+}
+
+// maxRequestBody reads the cap on the request body the gateway buffers before deciding
+// (PASSPORT_MAX_REQUEST_BODY, in bytes). It returns 0 for "unset", which selects the
+// gateway's own default. A non-positive or unparseable value is a startup error rather than
+// a silent fallback: an operator who tried to configure the cap and got it wrong should not
+// discover at 3am that they are running on the default — and "0 means unlimited" is not on
+// offer, since the buffer is filled before the caller is authenticated.
+func maxRequestBody() (int64, error) {
+	v := strings.TrimSpace(os.Getenv("PASSPORT_MAX_REQUEST_BODY"))
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("PASSPORT_MAX_REQUEST_BODY must be a positive number of bytes, got %q", v)
+	}
+	log.Printf("buffering at most %d bytes of request body per request", n)
+	return n, nil
 }
 
 func envOr(key, def string) string {

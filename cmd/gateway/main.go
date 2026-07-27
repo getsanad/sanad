@@ -12,6 +12,7 @@
 //	PASSPORT_VC_TRUSTED_ISSUERS  comma-separated trusted issuer DIDs (vc mode)
 //	PASSPORT_WORKLOAD_CA         base64url Ed25519 CA pubkey; enables instance auth + delegation
 //	PASSPORT_ALLOW_DIRECT_PRINCIPAL  1 = accept requests with no delegation chain (default: reject)
+//	PASSPORT_FORWARD_HEADERS     extra inbound headers forwarded upstream, comma-separated
 //	PASSPORT_ISSUER_NAME         `iss` placed on minted passports (default sanad)
 //	PASSPORT_SIGNING_KID         signing key id (default gateway-dev)
 //	PASSPORT_REVOCATION_DSN      Postgres DSN for a shared kill-switch (empty = in-memory)
@@ -195,7 +196,16 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, er
 			return types.Decision{Effect: types.EffectAllow, Reason: "allow-all (dev)"}, nil
 		})
 	}
-	mint := sts.MintStage(sts.New(signer, sts.Config{Issuer: envOr("PASSPORT_ISSUER_NAME", "sanad")}))
+	// Token isolation (FR-8): the mint stage forwards the minted passport plus a minimal
+	// transport allowlist, and drops everything else the caller sent. PASSPORT_FORWARD_HEADERS
+	// widens that allowlist for upstreams that legitimately need a header of their own (e.g.
+	// "Origin,traceparent"); the default is the safe minimum.
+	var mopts []sts.StageOption
+	if extra := headerNames(os.Getenv("PASSPORT_FORWARD_HEADERS")); len(extra) > 0 {
+		log.Printf("PASSPORT_FORWARD_HEADERS: also forwarding %s upstream", strings.Join(extra, ", "))
+		mopts = append(mopts, sts.WithForwardHeaders(extra...))
+	}
+	mint := sts.MintStage(sts.New(signer, sts.Config{Issuer: envOr("PASSPORT_ISSUER_NAME", "sanad")}), mopts...)
 
 	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, nil, nil), mint)
 	return gateway.Pipeline{Stages: stages}, nil
@@ -242,6 +252,18 @@ func buildPrincipalAuth(ctx context.Context, ks principal.StatusChecker, store *
 	default:
 		return nil, fmt.Errorf("gateway: unknown PASSPORT_PRINCIPAL_MODE %q", os.Getenv("PASSPORT_PRINCIPAL_MODE"))
 	}
+}
+
+// headerNames parses a comma-separated list of header names ("Origin, traceparent"),
+// dropping blanks. Canonicalization is the mint stage's job.
+func headerNames(spec string) []string {
+	var out []string
+	for name := range strings.SplitSeq(spec, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func envOr(key, def string) string {

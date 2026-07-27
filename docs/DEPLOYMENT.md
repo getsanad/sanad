@@ -120,3 +120,11 @@ every request and fails `/readyz`. That is deliberate: past the bound the gatewa
 longer promise a revocation has reached it (NFR-4), and a kill-switch that cannot see its
 deny list must stop traffic rather than wave it through. **Alert on the gauge approaching
 the bound** — it goes off long before any request is denied.
+
+The write side is just as blunt: if `POST /admin/revoke` (or `/admin/restore`) cannot reach
+that database, it answers **503**, never a reassuring 200, with a body naming the ids that
+did and did not take effect — `{"error": ..., "op": "revoke", "applied": [], "failed":
+["p1","a1"]}`. A cascade (a principal plus its agents) is written as one transaction, so a
+failure leaves nothing half-applied; retry it. The underlying cause goes to the admin log
+only, so it never leaks the DSN to the caller. **Treat a 5xx here as "the agent is still
+live"** and escalate.

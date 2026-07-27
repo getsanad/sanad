@@ -70,6 +70,20 @@ func TestStore(t *testing.T) {
 		t.Fatalf("List() = %v; want [agent-1 principal-9] (sorted)", ids)
 	}
 
+	// A cascade is written as one batch, in a transaction (all-or-nothing).
+	if err := s.Revoke("principal-2", "agent-20", "agent-21"); err != nil {
+		t.Fatalf("batch revoke: %v", err)
+	}
+	if ids, err := s.List(); err != nil || len(ids) != 5 {
+		t.Fatalf("List() = %v, %v; want 5 ids after the batch", ids, err)
+	}
+	if err := s.Restore("principal-2", "agent-20", "agent-21"); err != nil {
+		t.Fatalf("batch restore: %v", err)
+	}
+	if ids, err := s.List(); err != nil || len(ids) != 2 {
+		t.Fatalf("List() = %v, %v; want the batch gone again", ids, err)
+	}
+
 	// A CachedStore over this Source resolves the hot path locally and refreshes.
 	cs, err := revoke.NewCachedStore(s, 0)
 	if err != nil {

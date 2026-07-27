@@ -53,8 +53,9 @@ func main() {
 
 // buildKillSwitch returns the control-plane kill-switch. With PASSPORT_REVOCATION_DSN it
 // writes through to the shared Postgres source the gateway reads; otherwise it is a local
-// in-memory store (this process only). A failed durable write is logged loudly rather than
-// silently dropped — on a kill-switch, an unnoticed failed revoke is a security incident.
+// in-memory store (this process only). A failed durable write is returned to the operator
+// who asked for it (the API answers 5xx, never a reassuring 200) and logged loudly here as
+// well — on a kill-switch, an unnoticed failed revoke is a security incident.
 func buildKillSwitch() (revoke.Store, error) {
 	dsn := os.Getenv("PASSPORT_REVOCATION_DSN")
 	if dsn == "" {

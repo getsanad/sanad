@@ -2,6 +2,8 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 
 	"github.com/getsanad/sanad/pkg/types"
@@ -77,8 +79,7 @@ func NewHandler(svc *Service, token string) http.Handler {
 		if !decode(w, r, &in) {
 			return
 		}
-		svc.Restore(in.ID)
-		writeJSON(w, http.StatusOK, map[string]string{"restored": in.ID})
+		respond(w, http.StatusOK, svc.Restore(in.ID), map[string]string{"restored": in.ID})
 	})
 	mux.HandleFunc("GET /admin/revocations", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, svc.Revocations())
@@ -117,13 +118,35 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
-// respond writes v with code on success, or maps a service error to 400.
+// respond writes v with code on success, or maps a service error to a status (writeError).
 func respond(w http.ResponseWriter, code int, err error, v any) {
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, code, v)
+}
+
+// writeError maps a service error to a response. A failure of the durable kill-switch is the
+// server's problem, not the caller's: it must never read as success — an operator told "200
+// revoked" walks away believing the agent is cut off — and it is not a 400 either, so it
+// becomes 503 with an explicit account of which ids did and did not take effect. The cause
+// itself stays in the server log; it can carry a DSN, host, or driver detail that must not
+// leave the process. Everything else is a validation error the caller can act on and keeps
+// its message, which this package writes itself.
+func writeError(w http.ResponseWriter, err error) {
+	var se *StoreError
+	if errors.As(err, &se) {
+		log.Printf("%v", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   se.Public(),
+			"op":      se.Op,
+			"applied": se.Applied,
+			"failed":  se.Failed(),
+		})
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

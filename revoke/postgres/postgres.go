@@ -91,24 +91,52 @@ func (s *Store) ctx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), s.timeout)
 }
 
-// Revoke adds an id to the deny list. Idempotent: revoking an already-revoked id is a no-op.
-func (s *Store) Revoke(id string) error {
-	ctx, cancel := s.ctx()
-	defer cancel()
-	q := fmt.Sprintf(`INSERT INTO %s (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, s.table)
-	if _, err := s.db.ExecContext(ctx, q, id); err != nil {
-		return fmt.Errorf("postgres: revoke %q: %w", id, err)
-	}
-	return nil
+// Revoke adds ids to the deny list, atomically: a cascade (a principal plus every agent
+// under it, FR-19) is one transaction, so a failure part-way through cannot leave some
+// descendants revoked and others still operating. Idempotent: revoking an already-revoked id
+// is a no-op.
+func (s *Store) Revoke(ids ...string) error {
+	return s.write("revoke", `INSERT INTO %s (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, ids)
 }
 
-// Restore removes an id from the deny list. Idempotent.
-func (s *Store) Restore(id string) error {
+// Restore removes ids from the deny list, atomically and idempotently.
+func (s *Store) Restore(ids ...string) error {
+	return s.write("restore", `DELETE FROM %s WHERE id = $1`, ids)
+}
+
+// write applies a single-id statement to every id, all-or-nothing. A batch of one is a plain
+// Exec; anything larger runs inside a transaction. It repeats a parameterized statement per
+// id rather than binding an array because array parameters are driver-specific and this
+// package targets plain database/sql (see the package doc) — and a batch here is a principal
+// and its agents, tens of rows at most, so the extra round-trips do not matter.
+func (s *Store) write(op, query string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	ctx, cancel := s.ctx()
 	defer cancel()
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, s.table)
-	if _, err := s.db.ExecContext(ctx, q, id); err != nil {
-		return fmt.Errorf("postgres: restore %q: %w", id, err)
+	q := fmt.Sprintf(query, s.table)
+
+	if len(ids) == 1 {
+		if _, err := s.db.ExecContext(ctx, q, ids[0]); err != nil {
+			return fmt.Errorf("postgres: %s %q: %w", op, ids[0], err)
+		}
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: %s: begin: %w", op, err)
+	}
+	// Rolls the batch back on any early return; a no-op once Commit has succeeded.
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			return fmt.Errorf("postgres: %s %q (batch of %d rolled back): %w", op, id, len(ids), err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("postgres: %s: commit batch of %d: %w", op, len(ids), err)
 	}
 	return nil
 }

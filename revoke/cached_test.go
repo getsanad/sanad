@@ -39,6 +39,36 @@ func TestCachedStoreReadWrite(t *testing.T) {
 	}
 }
 
+// writeFailSource is a Source whose writes fail while List keeps working, so a CachedStore
+// can be built over it and then asked to write.
+type writeFailSource struct {
+	Source
+	err error
+}
+
+func (s *writeFailSource) Revoke(...string) error { return s.err }
+
+// TestCachedStoreFailedWriteLeavesSnapshotUnchanged: the write-through is all-or-nothing. If
+// the Source rejects the batch, the local snapshot must not pretend any of it landed — the
+// admin plane would then read back a revocation the gateways will never see.
+func TestCachedStoreFailedWriteLeavesSnapshotUnchanged(t *testing.T) {
+	src := &writeFailSource{Source: NewMemSource(), err: errors.New("db down")}
+	c, err := NewCachedStore(src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.Revoke("p1", "a1"); !errors.Is(err, src.err) {
+		t.Fatalf("Revoke() = %v; want the source error returned to the caller", err)
+	}
+	for _, id := range []string{"p1", "a1"} {
+		if c.Revoked(id) {
+			t.Fatalf("%s must not appear in the snapshot after a failed durable write", id)
+		}
+	}
+}
+
 // TestCachedStoreCrossReplica simulates two gateway replicas over one shared Source: a
 // revocation written by one replica reaches the other after its next refresh.
 func TestCachedStoreCrossReplica(t *testing.T) {

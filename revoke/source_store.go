@@ -1,16 +1,20 @@
 package revoke
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // SyncStore adapts a durable Source (error-returning, e.g. Postgres) to the Store interface
 // used by the admin control plane. It is NOT for the gateway hot path — each call hits the
 // Source directly — so it belongs to admin operations (revoke/restore/list a handful of
 // times), not to per-request decisions, which use a CachedStore.
 //
-// Store's methods cannot return an error, so a Source failure is reported through OnError
-// instead of being silently dropped. On a kill-switch a failed revoke MUST be visible:
-// callers should set OnError to log loudly and/or alert. A failed List returns nil (empty),
-// which is the safe direction for the admin's read-back — it never invents revocations.
+// A write failure is returned to the caller, so the operator who flipped the kill-switch
+// learns that it did not take effect, and is *additionally* reported through OnError, which
+// is the alerting hook and the only channel for List — whose signature cannot carry an
+// error. A failed List returns nil (empty), which is the safe direction for the admin's
+// read-back: it never invents revocations.
 type SyncStore struct {
 	src     Source
 	OnError func(op, id string, err error)
@@ -25,23 +29,32 @@ func NewSyncStore(src Source, onError func(op, id string, err error)) *SyncStore
 	return &SyncStore{src: src, OnError: onError}
 }
 
-func (s *SyncStore) report(op, id string, err error) {
+// report passes err to the alerting hook (if any) and hands it back, so the write methods
+// can both alert and return in one line.
+func (s *SyncStore) report(op, id string, err error) error {
 	if err != nil && s.OnError != nil {
 		s.OnError(op, id, err)
 	}
+	return err
 }
 
-// Revoke writes through to the Source, reporting any error via OnError.
-func (s *SyncStore) Revoke(id string) { s.report("revoke", id, s.src.Revoke(id)) }
+// Revoke writes ids through to the Source atomically, returning any error to the caller and
+// reporting it via OnError.
+func (s *SyncStore) Revoke(ids ...string) error {
+	return s.report("revoke", strings.Join(ids, ","), s.src.Revoke(ids...))
+}
 
-// Restore writes through to the Source, reporting any error via OnError.
-func (s *SyncStore) Restore(id string) { s.report("restore", id, s.src.Restore(id)) }
+// Restore writes ids through to the Source atomically, returning any error to the caller and
+// reporting it via OnError.
+func (s *SyncStore) Restore(ids ...string) error {
+	return s.report("restore", strings.Join(ids, ","), s.src.Restore(ids...))
+}
 
 // List returns the revoked ids from the Source, or nil on error (reported via OnError).
 func (s *SyncStore) List() []string {
 	ids, err := s.src.List()
 	if err != nil {
-		s.report("list", "", err)
+		_ = s.report("list", "", err)
 		return nil
 	}
 	return ids

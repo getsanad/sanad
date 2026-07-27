@@ -37,11 +37,26 @@ type FreshnessChecker interface {
 	CheckFresh() error
 }
 
-// Store is the kill-switch / deny-list. Revoking an id immediately stops issuance for it.
+// Store is the kill-switch / deny-list as the control plane sees it. Revoking an id
+// immediately stops issuance for it.
+//
+// The write methods return an error and the read method (Checker.Revoked) does not, and that
+// asymmetry is deliberate. Revoked is the gateway hot path: it must stay a fast, local,
+// non-failing lookup, and a Checker that cannot answer honestly says so through
+// FreshnessChecker instead. The writes are control-plane operations against a durable,
+// shared store that really can fail (Postgres unreachable, statement timeout), and an
+// operator who hits the kill-switch has to be told when the revocation did not land — a
+// silently dropped revoke is the worst failure this system has, because the operator walks
+// away believing the agent is cut off.
+//
+// Both writes take a batch and apply it atomically: either every id lands durably or none
+// does. That is what lets a cascade (a principal plus every agent under it, FR-19) be
+// all-or-nothing instead of leaving some descendants operating after a partial failure.
+// Calling with no ids is a no-op.
 type Store interface {
 	Checker
-	Revoke(id string)
-	Restore(id string)
+	Revoke(ids ...string) error
+	Restore(ids ...string) error
 	List() []string
 }
 
@@ -53,23 +68,34 @@ type MemStore struct {
 	revoked map[string]struct{}
 }
 
+// Compile-time check: MemStore is a control-plane Store.
+var _ Store = (*MemStore)(nil)
+
 // NewMemStore returns an empty kill-switch.
 func NewMemStore() *MemStore {
 	return &MemStore{revoked: map[string]struct{}{}}
 }
 
-// Revoke adds an id (principal, agent, or blueprint) to the deny list.
-func (m *MemStore) Revoke(id string) {
+// Revoke adds ids (principals, agents, or blueprints) to the deny list. The batch is applied
+// under one lock, so a cascade is never observed half-applied. The error is always nil — an
+// in-process map write cannot fail — and exists only to satisfy Store.
+func (m *MemStore) Revoke(ids ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.revoked[id] = struct{}{}
+	for _, id := range ids {
+		m.revoked[id] = struct{}{}
+	}
+	return nil
 }
 
-// Restore removes an id from the deny list.
-func (m *MemStore) Restore(id string) {
+// Restore removes ids from the deny list, under one lock and always successfully.
+func (m *MemStore) Restore(ids ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.revoked, id)
+	for _, id := range ids {
+		delete(m.revoked, id)
+	}
+	return nil
 }
 
 // Revoked reports whether an id is on the deny list.

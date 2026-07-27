@@ -143,7 +143,7 @@ func main() {
 
 	// --- request 2: denied after revocation ---------------------------------------
 	section("Request 2: revoke the principal, then call again")
-	ks.Revoke(principalDID)
+	_ = ks.Revoke(principalDID) // in-process store: cannot fail
 	resp2, _ := send()
 	body2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()

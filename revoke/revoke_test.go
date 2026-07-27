@@ -29,6 +29,28 @@ func TestMemStoreRevokeRestore(t *testing.T) {
 	}
 }
 
+// TestMemStoreBatchWrites covers the shape the control plane uses for a cascade: one call
+// carrying the principal and every agent under it.
+func TestMemStoreBatchWrites(t *testing.T) {
+	ks := NewMemStore()
+	if err := ks.Revoke("p1", "a1", "a2"); err != nil {
+		t.Fatalf("batch revoke: %v", err)
+	}
+	if got := ks.List(); len(got) != 3 {
+		t.Fatalf("List() = %v; want all three ids", got)
+	}
+	if err := ks.Restore("p1", "a1", "a2"); err != nil {
+		t.Fatalf("batch restore: %v", err)
+	}
+	if got := ks.List(); len(got) != 0 {
+		t.Fatalf("List() = %v; want empty", got)
+	}
+	// An empty batch is a no-op, not a panic or an error.
+	if err := ks.Revoke(); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}
+
 func TestStageBlocksRevoked(t *testing.T) {
 	ks := NewMemStore()
 	stage := Stage(ks)

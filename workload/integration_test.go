@@ -42,6 +42,28 @@ func key(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
+// enrollAgent issues a workload credential for agentID and registers its key in store, the
+// way InstanceStage does for an instance that authenticated on an earlier request. That is
+// the only way into the agent namespace: KeyStore has no direct setter for it, so an agent
+// key is always one the CA signed.
+func enrollAgent(t *testing.T, att *workload.TokenAttestor, a *workload.Authority, store *workload.KeyStore, token, agentID string, pub ed25519.PublicKey) {
+	t.Helper()
+	if err := att.Register(token, agentID); err != nil {
+		t.Fatal(err)
+	}
+	nonce, err := a.Nonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := a.Issue(workload.BootstrapEvidence(token, nonce, pub), nonce, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(cred); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestLiveInstanceAndDelegation drives the full P2 vertical through the real gateway:
 // principal auth (stubbed) -> instance auth via workload credential + proof of possession
 // -> multi-hop delegation verified against the shared KeyStore -> passport minted with the
@@ -64,11 +86,12 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 	a1Pub, a1Priv := key(t)
 	a2Pub, a2Priv := key(t)
 
-	// Shared key directory: principal root key + agent-1 (already known) + the CA for
-	// verifying the agent-2 credential the instance stage will add.
+	// Shared key directory: principal root key (principal namespace) + agent-1, enrolled
+	// earlier (agent namespace) + the CA for verifying the agent-2 credential the instance
+	// stage will add.
 	store := workload.NewKeyStore(caPub)
-	store.AddKey("principal-1", principalPub, time.Time{})
-	store.AddKey("agent-1", a1Pub, time.Now().Add(time.Hour))
+	store.AddPrincipalKey("principal-1", principalPub, time.Time{})
+	enrollAgent(t, att, authority, store, "boot-1", "agent-1", a1Pub)
 
 	// agent-2 obtains its instance credential, answering a nonce from the authority with
 	// evidence that covers the key being enrolled.
@@ -174,8 +197,8 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 	a2Pub, a2Priv := key(t)
 
 	store := workload.NewKeyStore(caPub)
-	store.AddKey("principal-1", principalPub, time.Time{})
-	store.AddKey("agent-1", a1Pub, time.Now().Add(time.Hour))
+	store.AddPrincipalKey("principal-1", principalPub, time.Time{})
+	enrollAgent(t, att, authority, store, "boot-1", "agent-1", a1Pub)
 	nonce, _ := authority.Nonce()
 	cred, err := authority.Issue(workload.BootstrapEvidence("boot-2", nonce, a2Pub), nonce, a2Pub)
 	if err != nil {

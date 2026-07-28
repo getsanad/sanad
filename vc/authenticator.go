@@ -13,9 +13,11 @@ import (
 
 // KeyRegistrar receives a principal's key on successful authentication so delegation
 // chains rooted at that principal can be verified (PRD FR-10). workload.KeyStore satisfies
-// it, closing the principal-key gap noted in P2-02.
+// it, closing the principal-key gap noted in P2-02. The method names the namespace it writes
+// to: a principal key is registered where only a principal lookup reads, never where an agent
+// id could reach it.
 type KeyRegistrar interface {
-	AddKey(id string, pub ed25519.PublicKey, notAfter time.Time)
+	AddPrincipalKey(id string, pub ed25519.PublicKey, notAfter time.Time)
 }
 
 // Authenticator verifies a presented principal VC and maps it to a types.Principal. It
@@ -66,7 +68,7 @@ func (a *Authenticator) Authenticate(_ context.Context, raw string) (*types.Prin
 		if c.ExpirationDate != "" {
 			exp, _ = time.Parse(time.RFC3339, c.ExpirationDate)
 		}
-		a.registrar.AddKey(subject.ID, pub, exp)
+		a.registrar.AddPrincipalKey(subject.ID, pub, exp)
 	}
 	return &types.Principal{ID: subject.ID, Subject: subject.ID, Assurance: subject.Assurance}, nil
 }

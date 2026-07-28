@@ -77,7 +77,7 @@ func main() {
 	bearer := base64.RawURLEncoding.EncodeToString(vcJSON)
 
 	att := workload.NewTokenAttestor()
-	att.Register("boot-token", "agent-1")
+	_ = att.Register("boot-token", "agent-1") // a valid agent id: cannot fail
 	authority, _ := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
 	// Enrollment answers a single-use nonce from the authority with evidence that covers the
 	// key being enrolled, so a captured attestation cannot be replayed with a different key.

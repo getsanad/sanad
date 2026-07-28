@@ -24,10 +24,16 @@ func newParty(t *testing.T, id string) party {
 	return party{id: id, pub: pub, priv: priv}
 }
 
-func registry(parties ...party) MemKeyRegistry {
-	m := MemKeyRegistry{}
-	for _, p := range parties {
-		m[p.id] = p.pub
+// registry puts p in the principal namespace and agents in the agent namespace. The two are
+// separate (KeyRegistry), so a test has to say which a party is — the root hop's delegator is
+// resolved as a principal, every later one as an agent.
+func registry(p party, agents ...party) MemKeyRegistry {
+	m := MemKeyRegistry{
+		Principals: map[string]ed25519.PublicKey{p.id: p.pub},
+		Agents:     map[string]ed25519.PublicKey{},
+	}
+	for _, a := range agents {
+		m.Agents[a.id] = a.pub
 	}
 	return m
 }
@@ -128,7 +134,8 @@ func TestImpersonationRejected(t *testing.T) {
 func TestUnknownDelegatorKeyRejected(t *testing.T) {
 	principal := newParty(t, "principal-1")
 	agent := newParty(t, "agent-1")
-	keys := registry(agent) // principal key missing
+	// Only the agent's key is registered; the principal namespace is empty.
+	keys := MemKeyRegistry{Agents: map[string]ed25519.PublicKey{agent.id: agent.pub}}
 
 	chain, _ := NewRoot(principal.priv, principal.id, agent.id, Grant{Tools: []string{"read"}})
 	if _, _, err := Verify(chain, keys, principal.id, time.Now()); err == nil {

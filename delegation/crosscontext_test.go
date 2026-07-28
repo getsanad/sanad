@@ -72,7 +72,7 @@ func TestInstanceProofDoesNotForgeADelegationHop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.AddKey(principalID, principalPub, time.Time{})
+	store.AddPrincipalKey(principalID, principalPub, time.Time{})
 
 	// A legitimate, unconstrained root hop principal -> agent.
 	chain, err := NewRoot(principalPriv, principalID, agentID, Grant{})
@@ -320,7 +320,7 @@ func TestDelegationHopDoesNotForgeACapabilityBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys := MemKeyRegistry{principalID: rootPub}
+	keys := MemKeyRegistry{Principals: map[string]ed25519.PublicKey{principalID: rootPub}}
 	spliced := Chain{Hops: []Hop{{
 		Delegator: principalID, Delegate: "agent-1", Grant: g, Signature: cap.Blocks[0].Signature,
 	}}}
@@ -362,7 +362,7 @@ func TestExchangeTokenDoesNotForgeADelegationHop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keys := MemKeyRegistry{principalID: pub}
+	keys := MemKeyRegistry{Principals: map[string]ed25519.PublicKey{principalID: pub}}
 	spliced := Chain{Hops: []Hop{{
 		Delegator: principalID, Delegate: "agent-1", Grant: g, Signature: tok.Signature,
 	}}}

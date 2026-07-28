@@ -6,7 +6,11 @@
 //
 //	PASSPORT_AUTHORITY_ADDR    listen address (default :8082)
 //	PASSPORT_CA_KEY            base64url Ed25519 private key (generated + printed if unset — DEV ONLY)
-//	PASSPORT_BOOTSTRAP_TOKENS  "token=agentID,token2=agentID2" — the accepted bootstrap tokens
+//	PASSPORT_BOOTSTRAP_TOKENS  "token=agentID,token2=agentID2" — the accepted bootstrap tokens.
+//	                           An agentID is a local name: alphanumerics, '.', '_' or '-',
+//	                           starting with an alphanumeric (workload.ValidAgentID). Principal
+//	                           ids (did:key:..., an OIDC subject) are a separate namespace and
+//	                           are refused here.
 //	PASSPORT_CREDENTIAL_TTL    credential lifetime, e.g. 1h (default 1h)
 //
 // This uses bootstrap-token attestation (dev/self-host). A high-assurance deployment swaps
@@ -38,7 +42,12 @@ func main() {
 			if !ok || tok == "" || agentID == "" {
 				log.Fatalf("authority: bad PASSPORT_BOOTSTRAP_TOKENS entry %q (want token=agentID)", entry)
 			}
-			att.Register(tok, agentID)
+			// Register enforces the agent-id rule (workload.ValidAgentID), so an id shaped like
+			// a principal's DID stops the authority at startup instead of minting credentials
+			// for an agent that claims a principal's name.
+			if err := att.Register(tok, agentID); err != nil {
+				log.Fatalf("authority: bad PASSPORT_BOOTSTRAP_TOKENS entry %q: %v", entry, err)
+			}
 			n++
 		}
 	}

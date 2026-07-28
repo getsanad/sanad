@@ -132,8 +132,10 @@ func (m *MeasuredAttestor) Attest(evidence, nonce []byte, pubKey ed25519.PublicK
 	if m.maxAge > 0 && m.now().UTC().Sub(q.IssuedAt) > m.maxAge {
 		return "", errors.New("workload: stale attestation quote")
 	}
-	if q.AgentID == "" {
-		return "", errors.New("workload: attestation quote has no agent id")
+	// The quote names the agent, and the attestation key is trusted to say so — but not to
+	// say it in the principal namespace's format (ValidAgentID).
+	if err := ValidAgentID(q.AgentID); err != nil {
+		return "", err
 	}
 	return q.AgentID, nil
 }

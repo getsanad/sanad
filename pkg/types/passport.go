@@ -24,9 +24,16 @@ type Passport struct {
 	AgentID     string
 	Audience    string // single target MCP server (audience-restricted, SEC-2)
 	Scope       Scope
-	Delegation  *DelegationChain // empty in P1; populated in P2-04 (PRD FR-10)
-	IssuedAt    time.Time
-	ExpiresAt   time.Time
+	// Delegation is the FULL verified chain, hop signatures and all. It is set gateway-side
+	// (the delegation stage puts it here on the way to minting) and recorded in the audit
+	// log; it is deliberately not what the token carries — see DelegationRef.
+	Delegation *DelegationChain
+	// DelegationRef is the delegation as it travels on the wire (PRD FR-10): the ordered
+	// path of parties plus a digest of the full chain. This is the field a resource server
+	// reads back off a verified passport, and the one the codec round-trips.
+	DelegationRef *DelegationRef
+	IssuedAt      time.Time
+	ExpiresAt     time.Time
 }
 
 // Expired reports whether the passport is at or past its expiry at time t.

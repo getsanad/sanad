@@ -445,21 +445,83 @@ func TestToClaimsToPassportRoundTrip(t *testing.T) {
 	}
 }
 
-// TestToClaimsToPassportDropsDelegation documents that ToClaims/ToPassport do not carry
-// the delegation chain (P1: chain is empty; carried separately in P2-04). A passport with
-// a non-nil chain comes back with a nil chain.
-func TestToClaimsToPassportDropsDelegation(t *testing.T) {
+// TestToClaimsToPassportCarriesDelegation is the inverse of the loss this codec used to
+// document: the delegation must reach the resource server, or "a signed chain from the
+// accountable human to the action" stops at the gateway's own log.
+//
+// What crosses is the summary — the ordered path plus a digest of the full signed chain —
+// not the hops themselves; see types.DelegationRef for why. So the assertions are: the path
+// arrives intact, it is anchored at the principal and the acting agent, and the digest still
+// identifies the exact chain it was minted from.
+func TestToClaimsToPassportCarriesDelegation(t *testing.T) {
+	chain := &types.DelegationChain{Hops: []types.DelegationHop{
+		{Delegator: "p", Delegate: "a", Scope: types.Scope{Tools: []string{"read", "write"}}, Signature: []byte("sig-1")},
+		{Delegator: "a", Delegate: "sub", Scope: types.Scope{Tools: []string{"read"}}, Signature: []byte("sig-2")},
+	}}
 	in := types.Passport{
 		ID:          "jti-d",
 		PrincipalID: "p",
+		AgentID:     "sub",
 		Audience:    "server-a",
-		Delegation:  &types.DelegationChain{Hops: []types.DelegationHop{{Delegator: "p", Delegate: "a"}}},
+		Scope:       types.Scope{Tools: []string{"read"}},
+		Delegation:  chain,
 		IssuedAt:    at(2026),
 		ExpiresAt:   at(2026).Add(time.Minute),
 	}
+
 	got := ToClaims(in, "iss").ToPassport()
-	if got.Delegation != nil {
-		t.Fatalf("delegation unexpectedly round-tripped: %+v", got.Delegation)
+	if got.DelegationRef == nil {
+		t.Fatal("the delegation was dropped: the resource server cannot see who delegated what to whom")
+	}
+	want := []string{"p", "a", "sub"}
+	if strings.Join(got.DelegationRef.Path, ",") != strings.Join(want, ",") {
+		t.Fatalf("delegation path = %v, want %v", got.DelegationRef.Path, want)
+	}
+	// The path must be anchored at both ends by claims the server already trusts, or it is
+	// an unattached list of names.
+	if got.DelegationRef.Path[0] != got.PrincipalID {
+		t.Fatalf("path root %q is not the accountable principal %q", got.DelegationRef.Path[0], got.PrincipalID)
+	}
+	if last := got.DelegationRef.Path[len(got.DelegationRef.Path)-1]; last != got.AgentID {
+		t.Fatalf("path ends at %q, not the acting agent %q", last, got.AgentID)
+	}
+	// The digest ties the passport to that exact chain and no other.
+	if !chain.Matches(got.DelegationRef) {
+		t.Fatalf("digest does not identify the chain it was minted from: %+v", got.DelegationRef)
+	}
+	altered := &types.DelegationChain{Hops: []types.DelegationHop{
+		{Delegator: "p", Delegate: "a", Scope: types.Scope{Tools: []string{"read", "write"}}, Signature: []byte("sig-1")},
+		{Delegator: "a", Delegate: "sub", Scope: types.Scope{Tools: []string{"read", "delete"}}, Signature: []byte("sig-2")},
+	}}
+	if altered.Matches(got.DelegationRef) {
+		t.Fatal("a chain with a widened hop must not match the passport's digest")
+	}
+
+	// Re-encoding a passport that came back off the wire is stable: it still carries the
+	// summary it arrived with, rather than losing it for want of a full chain.
+	again := ToClaims(got, "iss").ToPassport()
+	if again.DelegationRef == nil || again.DelegationRef.Digest != got.DelegationRef.Digest {
+		t.Fatalf("re-encode lost the delegation: %+v", again.DelegationRef)
+	}
+}
+
+// TestToClaimsNoDelegationOmitsTheClaim: a passport with no chain must not grow an empty
+// `dlg` object, which would read as "there was a delegation" to anything inspecting it.
+func TestToClaimsNoDelegationOmitsTheClaim(t *testing.T) {
+	for name, in := range map[string]types.Passport{
+		"nil chain":   {ID: "j", PrincipalID: "p", Audience: "a"},
+		"empty chain": {ID: "j", PrincipalID: "p", Audience: "a", Delegation: &types.DelegationChain{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := ToClaims(in, "iss")
+			if c.Delegation != nil {
+				t.Fatalf("dlg = %+v, want absent", c.Delegation)
+			}
+			pb, _ := json.Marshal(c)
+			if strings.Contains(string(pb), "dlg") {
+				t.Fatalf("dlg must be omitted from the wire form, got %s", pb)
+			}
+		})
 	}
 }
 

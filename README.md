@@ -9,6 +9,12 @@ single-purpose **passports** instead of long-lived keys.
 > to the source. Sanad builds the same thing for AI agents: a signed, verifiable chain
 > from the accountable human, through every delegation hop, to the action taken.
 
+That chain is carried end to end, not just kept in a log. The gateway verifies every hop's
+signature and its attenuation, then mints a passport that **carries the delegation path plus
+a digest of the chain, inside the signature** — so the MCP server at the far end sees who
+delegated what to whom, and refuses any tool the chain did not grant, offline. See
+[what a resource server can verify](#what-the-mcp-server-can-verify-offline).
+
 See [`Sanad-PRD.md`](Sanad-PRD.md) for the full product spec.
 
 > **New to the concepts?** [`docs/CONCEPTS.md`](docs/CONCEPTS.md) explains everything
@@ -22,9 +28,10 @@ make demo     # or: go run ./cmd/demo
 
 A self-contained, narrated run of the whole flow: it creates a VC principal, an
 attested agent instance, and a delegation chain; sends a real request through the
-gateway (showing the minted passport with scope `[read]`, and the caller's credential
-being stripped); then revokes the principal and shows the next request fail closed; then
-prints the tamper-evident audit log and an investigation. No external setup needed.
+gateway (showing the minted passport with scope `[read]` and the delegation path on it, and
+the caller's credential being stripped); shows the MCP server refusing an out-of-scope tool
+offline; then revokes the principal and shows the next request fail closed; then prints the
+tamper-evident audit log and an investigation. No external setup needed.
 
 ## Repository layout
 
@@ -40,7 +47,8 @@ prints the tamper-evident audit log and an investigation. No external setup need
 | `config/` | The configuration document (`PASSPORT_POLICY_FILE`) and its validation |
 | `revoke/` | Kill-switch / revocation |
 | `sts/` | Security token service: mints passports |
-| `verify/` | Offline passport verification library + MCP server adapter |
+| `verify/` | Offline passport verification library + MCP server adapter (incl. scope enforcement) |
+| `internal/mcprpc/` | Reads an MCP JSON-RPC body once and finds the tools it invokes — shared by the gateway and `verify` so both read a request the same way |
 | `audit/` | Tamper-evident log: hash chain → Merkle transparency log + witnesses |
 | `metrics/`, `jwks/`, `tooldefs/` | Metrics, JWKS publication, tool-definition drift |
 | `sdk/` | Go agent-developer SDK |
@@ -202,8 +210,61 @@ the deployment sets `PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act d
 - **AI coding agents:** the [`skills/sanad`](skills/sanad/SKILL.md) skill
   walks an agent through enrolling and routing its MCP traffic through the gateway.
 - **Manual / other languages:** it's just HTTP — set the headers yourself (see `cmd/demo`).
-  Verifying passports on the MCP-server side is the `verify` package (a few lines).
+  Verifying passports on the MCP-server side is the `verify` package (see below).
 - See [`docs/CONCEPTS.md`](docs/CONCEPTS.md) for what each piece means.
+
+## Protecting an MCP server
+
+The other side of the gateway. `verify` is a small library your MCP server embeds; it
+validates passports **offline** against the gateway's published JWKS, with no callback on the
+request path:
+
+```go
+v := verify.New(verify.StaticKeys{"kid-gw": gatewayPubKey})
+http.ListenAndServe(addr, verify.Middleware(v, "my-server-id", mcpHandler,
+    verify.EnforceScope()))   // refuse any tools/call the passport does not name
+```
+
+`EnforceScope()` is what makes "task-scoped" mean something at the point of use: without it a
+passport scoped to `["read"]` is accepted for a `delete` call, because nothing checks. It
+reads the tool out of the JSON-RPC body (in MCP streamable HTTP the tool is `params.name`, not
+in the URL) using the same parser the gateway authorized the request with, checks every
+element of a batch, and answers **403** for anything outside the scope. A handler that has
+already worked out its own tool name can call `verify.RequireScope(ctx, name)` instead.
+
+### What the MCP server can verify offline
+
+With only the gateway's public key, a verified passport establishes:
+
+| | |
+|---|---|
+| **Authenticity** | minted by the holder of that key; Ed25519 is pinned structurally, so `alg:none` and RS256↔HS256 confusion are impossible by construction |
+| **Audience** | minted for *this* server and no other — a passport for `server-a` is refused at `server-b` |
+| **Freshness** | not expired (passports live minutes) |
+| **Accountability** | `sub` is the accountable human, `agent` the acting agent, and `dlg` the **ordered delegation path between them** plus a SHA-256 digest of the full signed chain — read it with `verify.DelegationPath(p)` |
+| **Authority** | `scope` is the effective, most-narrowed tool set the chain conferred and policy allowed |
+
+What it **cannot** establish offline, stated plainly:
+
+- **Revocation since minting.** The kill-switch is gateway-side; the short TTL is the bound
+  on that window.
+- **The hop signatures themselves.** Verifying a hop needs the *delegator's* public key, and
+  a resource server has no registry of principal/agent keys — that is the gateway's job. The
+  passport carries the gateway's *signed assertion* about the chain it verified, plus a digest
+  that lets an auditor holding the full chain (from the audit log, or from the delegate)
+  prove this passport was minted from **that** chain and no other. The path is exactly as
+  trustworthy as `sub` and `agent` already are — and now equally falsifiable after the fact.
+- **The intermediate grants.** Only the effective scope travels. Carrying every hop's
+  signature would roughly double the token (1280 vs 735 bytes for a three-party chain) on a
+  credential sent with *every* request, and buy the server nothing it could act on.
+
+> **One sharp edge.** An **empty** scope is the unconstrained wildcard everywhere in this
+> system — `delegation`'s attenuation check and the gateway policy both read it that way — so
+> `EnforceScope()` accepts *any* tool for a passport with no scope. That is deliberate
+> consistency, not an oversight: such a passport asserts no narrower authority to enforce.
+> Whether one can be minted at all is decided upstream (`PASSPORT_ALLOW_DIRECT_PRINCIPAL`, and
+> whether the chain constrains tools). A server that will not serve on unbounded authority
+> adds `verify.RequireScopedPassport()`, which refuses it outright.
 
 ## Development
 

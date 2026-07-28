@@ -34,17 +34,23 @@ type header struct {
 }
 
 // Claims is the on-the-wire passport payload: a deliberately small JWT claim set.
+//
+// `dlg` is the delegation chain (PRD FR-10), and it is a SUMMARY — the ordered path of
+// parties plus a digest of the full signed chain — not the chain itself. A passport is sent
+// on every request, so the claim set is sized for the hot path: see types.DelegationRef for
+// what the resource server can and cannot conclude from it, and why the hop signatures are
+// not here.
 type Claims struct {
-	ID        string        `json:"jti"`
-	Issuer    string        `json:"iss"`
-	Principal string        `json:"sub"`
-	Audience  string        `json:"aud"` // single target MCP server (SEC-2)
-	Agent     string        `json:"agent,omitempty"`
-	Tools     []string      `json:"scope,omitempty"`
-	Budget    *types.Budget `json:"budget,omitempty"` // granted/attenuated budget (FR-11)
-	IssuedAt  int64         `json:"iat"`
-	ExpiresAt int64         `json:"exp"`
-	// The delegation chain (PRD FR-10) is carried in P2-04; empty in P1.
+	ID         string               `json:"jti"`
+	Issuer     string               `json:"iss"`
+	Principal  string               `json:"sub"`
+	Audience   string               `json:"aud"` // single target MCP server (SEC-2)
+	Agent      string               `json:"agent,omitempty"`
+	Tools      []string             `json:"scope,omitempty"`
+	Budget     *types.Budget        `json:"budget,omitempty"` // granted/attenuated budget (FR-11)
+	Delegation *types.DelegationRef `json:"dlg,omitempty"`    // delegation path + chain digest (FR-10)
+	IssuedAt   int64                `json:"iat"`
+	ExpiresAt  int64                `json:"exp"`
 }
 
 // Sign encodes claims as a compact JWS signed with priv (Ed25519). kid is embedded so
@@ -152,30 +158,44 @@ func KeyID(raw string) (string, error) {
 }
 
 // ToClaims maps a types.Passport into wire claims under the given issuer.
+//
+// The delegation is summarized, not copied: a passport minted gateway-side carries the full
+// verified chain, and `dlg` gets its path + digest. A passport that came back off the wire
+// already has only the summary, so it is carried through unchanged and re-encoding is
+// stable.
 func ToClaims(p types.Passport, issuer string) Claims {
+	ref := p.DelegationRef
+	if summary := p.Delegation.Ref(); summary != nil {
+		ref = summary
+	}
 	return Claims{
-		ID:        p.ID,
-		Issuer:    issuer,
-		Principal: p.PrincipalID,
-		Audience:  p.Audience,
-		Agent:     p.AgentID,
-		Tools:     p.Scope.Tools,
-		Budget:    p.Scope.Budget,
-		IssuedAt:  p.IssuedAt.Unix(),
-		ExpiresAt: p.ExpiresAt.Unix(),
+		ID:         p.ID,
+		Issuer:     issuer,
+		Principal:  p.PrincipalID,
+		Audience:   p.Audience,
+		Agent:      p.AgentID,
+		Tools:      p.Scope.Tools,
+		Budget:     p.Scope.Budget,
+		Delegation: ref,
+		IssuedAt:   p.IssuedAt.Unix(),
+		ExpiresAt:  p.ExpiresAt.Unix(),
 	}
 }
 
 // ToPassport maps wire claims back into a types.Passport (used by the verify library).
+// Delegation lands on DelegationRef, never on Delegation: the token carries the path and a
+// digest, so reconstructing a *DelegationChain here would fabricate hops whose empty
+// Signature fields would read as verified-and-unsigned.
 func (c Claims) ToPassport() types.Passport {
 	return types.Passport{
-		ID:          c.ID,
-		PrincipalID: c.Principal,
-		AgentID:     c.Agent,
-		Audience:    c.Audience,
-		Scope:       types.Scope{Tools: c.Tools, Budget: c.Budget},
-		IssuedAt:    time.Unix(c.IssuedAt, 0).UTC(),
-		ExpiresAt:   time.Unix(c.ExpiresAt, 0).UTC(),
+		ID:            c.ID,
+		PrincipalID:   c.Principal,
+		AgentID:       c.Agent,
+		Audience:      c.Audience,
+		Scope:         types.Scope{Tools: c.Tools, Budget: c.Budget},
+		DelegationRef: c.Delegation,
+		IssuedAt:      time.Unix(c.IssuedAt, 0).UTC(),
+		ExpiresAt:     time.Unix(c.ExpiresAt, 0).UTC(),
 	}
 }
 

@@ -16,95 +16,10 @@ import (
 // being invoked is params.name, which no amount of URL inspection can reach.
 const toolsCall = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_weather","arguments":{"location":"New York"}}}`
 
-func TestParseRPC(t *testing.T) {
-	tests := []struct {
-		name    string
-		body    string
-		want    []RPCCall
-		wantErr bool
-	}{
-		{
-			name: "tools/call names the tool in params.name",
-			body: toolsCall,
-			want: []RPCCall{{Method: "tools/call", Tool: "get_weather"}},
-		},
-		{
-			name: "tools/list invokes no tool of its own",
-			body: `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"abc"}}`,
-			want: []RPCCall{{Method: "tools/list"}},
-		},
-		{
-			name: "initialize invokes no tool of its own",
-			body: `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`,
-			want: []RPCCall{{Method: "initialize"}},
-		},
-		{
-			name: "notification has no id",
-			body: `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
-			want: []RPCCall{{Method: "notifications/initialized", Notification: true}},
-		},
-		{
-			// JSON-RPC 2.0 batching, which MCP streamable HTTP permitted through 2025-03-26.
-			name: "batch yields one call per element",
-			body: `[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}},
-			        {"jsonrpc":"2.0","method":"notifications/initialized"},
-			        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"admin_delete"}}]`,
-			want: []RPCCall{
-				{Method: "tools/call", Tool: "read"},
-				{Method: "notifications/initialized", Notification: true},
-				{Method: "tools/call", Tool: "admin_delete"},
-			},
-		},
-		{
-			// A client POSTing a response to a server-initiated request (sampling, elicitation)
-			// invokes nothing: no method, no call, nothing to authorize per tool.
-			name: "a JSON-RPC response is not a call",
-			body: `{"jsonrpc":"2.0","id":3,"result":{"content":[]}}`,
-			want: []RPCCall{},
-		},
-		{name: "empty batch", body: `[]`, want: []RPCCall{}},
-		{name: "malformed JSON", body: `{"jsonrpc":"2.0","method":`, want: []RPCCall{}},
-		{name: "not JSON at all", body: "\x00\x01binary", want: []RPCCall{}},
-		{name: "JSON that is not JSON-RPC", body: `{"hello":"world"}`, want: []RPCCall{}},
-		{name: "JSON scalar", body: `"just a string"`, want: []RPCCall{}},
-		{name: "empty body", body: "", want: []RPCCall{}},
-
-		// Fail closed: a message that says it is calling a tool but does not name one would
-		// otherwise be authorized as though it called none.
-		{name: "tools/call without params", body: `{"jsonrpc":"2.0","id":1,"method":"tools/call"}`, wantErr: true},
-		{name: "tools/call with no name", body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}`, wantErr: true},
-		{name: "tools/call with an empty name", body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":""}}`, wantErr: true},
-		{name: "tools/call with positional params", body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["read"]}`, wantErr: true},
-		{
-			name:    "a batch is refused if ANY element is unreadable",
-			body:    `[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}]`,
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseRPC([]byte(tc.body))
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("want an error, got calls %+v", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseRPC: %v", err)
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("got %d calls %+v, want %d %+v", len(got), got, len(tc.want), tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("call %d = %+v, want %+v", i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
+// The JSON-RPC parser itself is unit-tested where it lives, in internal/mcprpc — the gateway
+// and the resource-server-side scope check (verify.EnforceScope) share one implementation, so
+// they cannot drift into disagreeing about which tool a body invokes. What follows tests the
+// gateway's use of it: buffering, forwarding intact, and surfacing the calls to the pipeline.
 
 // recordRequest captures what the pipeline saw and mints, so a test can assert on the
 // decision input as well as the proxied result.

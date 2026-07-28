@@ -58,8 +58,13 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 	store.AddKey("principal-1", principalPub, time.Time{})
 	store.AddKey("agent-1", a1Pub, time.Now().Add(time.Hour))
 
-	// agent-2 obtains its instance credential.
-	cred, err := authority.Issue([]byte("boot-2"), a2Pub)
+	// agent-2 obtains its instance credential, answering a nonce from the authority with
+	// evidence that covers the key being enrolled.
+	nonce, err := authority.Nonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := authority.Issue(workload.BootstrapEvidence("boot-2", nonce, a2Pub), nonce, a2Pub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +164,8 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 	store := workload.NewKeyStore(caPub)
 	store.AddKey("principal-1", principalPub, time.Time{})
 	store.AddKey("agent-1", a1Pub, time.Now().Add(time.Hour))
-	cred, err := authority.Issue([]byte("boot-2"), a2Pub)
+	nonce, _ := authority.Nonce()
+	cred, err := authority.Issue(workload.BootstrapEvidence("boot-2", nonce, a2Pub), nonce, a2Pub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +280,8 @@ func TestLiveInstanceWrongProofDenied(t *testing.T) {
 	att.Register("boot-2", "agent-2")
 	authority, _ := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
 	a2Pub, _ := key(t)
-	cred, _ := authority.Issue([]byte("boot-2"), a2Pub)
+	nonce, _ := authority.Nonce()
+	cred, _ := authority.Issue(workload.BootstrapEvidence("boot-2", nonce, a2Pub), nonce, a2Pub)
 
 	_, attackerPriv := key(t) // attacker holds a different key
 	store := workload.NewKeyStore(caPub)

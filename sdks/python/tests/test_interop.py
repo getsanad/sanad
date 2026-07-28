@@ -13,6 +13,8 @@ from sanad import (
     HEADER_DELEGATION,
     HEADER_PROOF,
     PassportClient,
+    bootstrap_evidence,
+    enroll,
     generate_instance_key,
     proof,
     public_key_of,
@@ -26,6 +28,11 @@ SEED_B64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
 PRIV64_B64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA"
 # Expected public key (base64url of the raw 32-byte public key).
 PUB_B64 = "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
+
+# Enrollment nonce 0x00..0x1f, and the evidence Go's workload.BootstrapEvidence produces
+# for it with token "boot-token" and PUB_B64.
+NONCE_B64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+EXPECTED_EVIDENCE = "umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o"
 
 PRINCIPAL_TOKEN = "test-principal-token"
 EXPECTED_PROOF = "vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ"
@@ -173,6 +180,76 @@ class TestClientHeaders(unittest.TestCase):
             ur.urlopen = real_urlopen
         self.assertEqual(captured["url"], "https://gw.example.com/servers/srv-1/mcp/list")
         self.assertEqual(captured["method"], "POST")
+
+
+class TestEnrollment(unittest.TestCase):
+    def test_bootstrap_evidence_matches_go_vector(self):
+        evidence = bootstrap_evidence(
+            "boot-token", _b64url_decode(NONCE_B64), _b64url_decode(PUB_B64)
+        )
+        self.assertEqual(_b64url_encode(evidence), EXPECTED_EVIDENCE)
+
+    def test_bootstrap_evidence_is_bound_to_nonce_and_key(self):
+        nonce = _b64url_decode(NONCE_B64)
+        pub = _b64url_decode(PUB_B64)
+        # Changing any input must change the evidence — otherwise a captured enrollment
+        # could be replayed with a different key, which is exactly what this prevents.
+        for token, n, p in [
+            ("boot-token", nonce, bytes(32)),
+            ("boot-token", bytes(32), pub),
+            ("other-token", nonce, pub),
+        ]:
+            self.assertNotEqual(
+                _b64url_encode(bootstrap_evidence(token, n, p)), EXPECTED_EVIDENCE
+            )
+
+    def test_enroll_fetches_a_nonce_then_posts_key_bound_evidence(self):
+        import urllib.request as ur
+
+        calls = []
+
+        class FakeResp:
+            def __init__(self, body):
+                self._body = body.encode("utf-8")
+
+            def read(self):
+                return self._body
+
+            def getcode(self):
+                return 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, *args, **kwargs):
+            calls.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+            if req.full_url.endswith("/enroll/nonce"):
+                return FakeResp(json.dumps({"nonce": NONCE_B64, "expires_in": 120}))
+            return FakeResp(CREDENTIAL_TEXT)
+
+        real_urlopen = ur.urlopen
+        ur.urlopen = fake_urlopen
+        try:
+            result = enroll("https://authority.example.com/", "boot-token", PUB_B64)
+        finally:
+            ur.urlopen = real_urlopen
+
+        self.assertEqual(result["credential"], CREDENTIAL_TEXT)
+        self.assertEqual(result["agent_id"], "agent-1")
+
+        # Two legs: the nonce, then the enrollment.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "https://authority.example.com/enroll/nonce")
+        url, body = calls[1]
+        self.assertEqual(url, "https://authority.example.com/enroll")
+        self.assertEqual(body["nonce"], NONCE_B64)
+        self.assertEqual(body["public_key"], PUB_B64)
+        # The bootstrap token is NOT on the wire; the evidence is a MAC over nonce + key.
+        self.assertEqual(body["evidence"], EXPECTED_EVIDENCE)
+        self.assertNotIn("boot-token", json.dumps(body))
 
 
 if __name__ == "__main__":

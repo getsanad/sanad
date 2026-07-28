@@ -9,6 +9,11 @@ Wire formats match the Go implementation byte-for-byte. All base64 is RFC 4648
 URL-safe with NO padding (Go's ``base64.RawURLEncoding``). Cryptography is
 Ed25519.
 
+Enrolling is two requests: the agent fetches a single-use nonce from the authority,
+then presents attestation evidence that covers both that nonce and the public key it
+is enrolling. That binding is what stops an enrollment captured off the wire from
+being replayed with somebody else's key.
+
 Typical use::
 
     from sanad import generate_instance_key, enroll, PassportClient
@@ -23,6 +28,8 @@ Typical use::
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import urllib.error
 import urllib.request
@@ -36,6 +43,8 @@ __all__ = [
     "generate_instance_key",
     "public_key_of",
     "proof",
+    "bootstrap_evidence",
+    "request_nonce",
     "enroll",
     "PassportClient",
     "Response",
@@ -152,24 +161,32 @@ def proof(private_key: str, principal_token: str) -> str:
 
 # --- Enrollment -----------------------------------------------------------------
 
-def enroll(authority_url: str, bootstrap_token: str, public_key: str) -> Dict[str, Any]:
-    """Enroll with the authority and return the issued workload credential.
+def bootstrap_evidence(bootstrap_token: str, nonce: bytes, public_key: bytes) -> bytes:
+    """Build the attestation evidence a Go ``workload.TokenAttestor`` accepts.
 
-    POSTs ``{"evidence": base64url(utf8(bootstrap_token)), "public_key": <base64url pub32>}``
-    to ``{authority_url}/enroll``. On HTTP 200 the response body is the credential
-    JSON, kept verbatim (its embedded signature must not be re-serialized).
+    An HMAC-SHA256, keyed by the bootstrap token, over the authority-issued nonce and
+    the public key being enrolled. Mirrors Go's ``workload.BootstrapEvidence``
+    byte-for-byte: the MAC input is the canonical JSON Go signs over, with the fields
+    in that order and the byte fields in standard (padded) base64, which is how Go's
+    ``encoding/json`` renders ``[]byte``.
 
-    :param authority_url: base URL of the authority service.
-    :param bootstrap_token: attestation bootstrap token (opaque string).
-    :param public_key: base64url of the 32-byte instance public key.
-    :returns: ``{"credential": <raw text>, "agent_id": ..., "not_after": ...}``.
-    :raises EnrollmentError: on a non-200 response.
+    The bootstrap token never leaves the process, and the result only enrolls this key
+    against this nonce — so an enrollment captured off the wire cannot be replayed with
+    somebody else's key.
     """
-    url = authority_url.rstrip("/") + "/enroll"
-    payload = {
-        "evidence": _b64url_encode(bootstrap_token.encode("utf-8")),
-        "public_key": public_key,
-    }
+    msg = json.dumps(
+        {
+            "ctx": "sanad/bootstrap-evidence/v1",
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "pub": base64.b64encode(public_key).decode("ascii"),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(bootstrap_token.encode("utf-8"), msg, hashlib.sha256).digest()
+
+
+def _post_json(url: str, payload: Dict[str, Any]) -> str:
+    """POST a JSON body and return the response text, raising EnrollmentError on failure."""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, method="POST", headers={"Content-Type": "application/json"}
@@ -184,6 +201,57 @@ def enroll(authority_url: str, bootstrap_token: str, public_key: str) -> Dict[st
 
     if status != 200:
         raise EnrollmentError(status, raw)
+    return raw
+
+
+def request_nonce(authority_url: str) -> bytes:
+    """Fetch a single-use enrollment nonce from ``POST {authority_url}/enroll/nonce``.
+
+    Mirrors Go's ``workload.RequestNonce``. The nonce is the RATS freshness challenge
+    (carried as EAT ``eat_nonce``): the authority accepts it exactly once, within a
+    short window, so an attestation built over it cannot be replayed.
+
+    :raises EnrollmentError: on a non-200 response or an unusable nonce.
+    """
+    raw = _post_json(authority_url.rstrip("/") + "/enroll/nonce", {})
+    nonce = json.loads(raw).get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        raise EnrollmentError(200, "authority returned an unusable nonce")
+    return _b64url_decode(nonce)
+
+
+def enroll(authority_url: str, bootstrap_token: str, public_key: str) -> Dict[str, Any]:
+    """Enroll with the authority and return the issued workload credential.
+
+    Mirrors Go's ``workload.Enroll``, which is two requests:
+
+    1. ``POST {authority_url}/enroll/nonce`` for a single-use challenge, then
+    2. ``POST {authority_url}/enroll`` with ``{"nonce": ..., "evidence": ...,
+       "public_key": ...}``, where the evidence covers both the nonce and the public
+       key (see :func:`bootstrap_evidence`).
+
+    On HTTP 200 the response body is the credential JSON, kept verbatim (its embedded
+    signature must not be re-serialized).
+
+    :param authority_url: base URL of the authority service.
+    :param bootstrap_token: attestation bootstrap token (opaque string).
+    :param public_key: base64url of the 32-byte instance public key.
+    :returns: ``{"credential": <raw text>, "agent_id": ..., "not_after": ...}``.
+    :raises EnrollmentError: on a non-200 response.
+    """
+    pub = _b64url_decode(public_key)
+    if len(pub) != _PUB_SIZE:
+        raise PassportError(f"instance public key must be {_PUB_SIZE} bytes, got {len(pub)}")
+
+    nonce = request_nonce(authority_url)
+    raw = _post_json(
+        authority_url.rstrip("/") + "/enroll",
+        {
+            "nonce": _b64url_encode(nonce),
+            "evidence": _b64url_encode(bootstrap_evidence(bootstrap_token, nonce, pub)),
+            "public_key": public_key,
+        },
+    )
 
     # Keep the credential text exactly as received; only parse for convenience fields.
     parsed = json.loads(raw)

@@ -32,6 +32,17 @@ function publicKeyOf(b64) {
 function proof(b64, token) {
   return crypto.sign(null, Buffer.from(token, 'utf8'), privObj(seedFromPrivateKey(b64))).toString('base64url');
 }
+// The evidence a Go workload.TokenAttestor accepts: HMAC-SHA256 keyed by the bootstrap
+// token over the canonical JSON of {ctx, nonce, pub}, with the byte fields in standard
+// (padded) base64 — how Go's encoding/json renders []byte.
+function bootstrapEvidence(token, nonce, pub) {
+  const msg = JSON.stringify({
+    ctx: 'sanad/bootstrap-evidence/v1',
+    nonce: Buffer.from(nonce).toString('base64'),
+    pub: Buffer.from(pub).toString('base64'),
+  });
+  return crypto.createHmac('sha256', Buffer.from(token, 'utf8')).update(msg).digest();
+}
 
 const SEED = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA';
 const FULL = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA';
@@ -39,6 +50,8 @@ const PUB = 'ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ';
 const PROOF = 'vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ';
 const CRED = '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","IssuedAt":"2026-07-10T00:00:00Z","NotAfter":"2026-07-10T01:00:00Z","KeyID":"ca-1","Signature":"AA=="}';
 const CRED_HEADER = 'eyJBZ2VudElEIjoiYWdlbnQtMSIsIlB1YmxpY0tleSI6IjNiNmEyN2JjY2ViNmE0MmQ2MmEzYThkMDJhNmYwZDczNjUzMjE1NzcxZGUyNDNhNjNhYzA0OGExOGI1OWRhMjkiLCJJc3N1ZWRBdCI6IjIwMjYtMDctMTBUMDA6MDA6MDBaIiwiTm90QWZ0ZXIiOiIyMDI2LTA3LTEwVDAxOjAwOjAwWiIsIktleUlEIjoiY2EtMSIsIlNpZ25hdHVyZSI6IkFBPT0ifQ';
+const NONCE = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
+const EVIDENCE = 'umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o';
 
 const results = [
   ['publicKeyOf(seed)', publicKeyOf(SEED), PUB],
@@ -47,6 +60,7 @@ const results = [
   ['proof(seed, "test-principal-token")', proof(SEED, 'test-principal-token'), PROOF],
   ['proof(64-byte form) == proof(seed)', proof(FULL, 'test-principal-token'), PROOF],
   ['base64url(utf8(credential))', Buffer.from(CRED, 'utf8').toString('base64url'), CRED_HEADER],
+  ['bootstrapEvidence("boot-token", nonce, pub)', bootstrapEvidence('boot-token', Buffer.from(NONCE, 'base64url'), Buffer.from(PUB, 'base64url')).toString('base64url'), EVIDENCE],
 ];
 
 let ok = true;

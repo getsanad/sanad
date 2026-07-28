@@ -23,12 +23,13 @@
 //	{
 //	  "version": 1,
 //	  "note": "production policy, owned by #security",
-//	  "policy": { "servers": { … } }
+//	  "policy":   { "servers": { … } },
+//	  "tooldefs": { "servers": { … } }
 //	}
 //
-// Today it carries one section, "policy" (policy.Config). Servers, principal mode, token TTLs
-// and storage are planned to join it as sibling sections; each owns its own schema in its own
-// package, so adding one touches File and nothing else.
+// Today it carries two sections, "policy" (policy.Config) and "tooldefs" (tooldefs.Config).
+// Servers, principal mode, token TTLs and storage are planned to join them as siblings; each
+// owns its own schema in its own package, so adding one touches File and nothing else.
 package config
 
 import (
@@ -41,6 +42,7 @@ import (
 	"strings"
 
 	"github.com/getsanad/sanad/policy"
+	"github.com/getsanad/sanad/tooldefs"
 )
 
 // Version is the only document version this build understands. A file that does not declare
@@ -56,6 +58,12 @@ type File struct {
 	// distinguishable from "present but empty" — the first is a mistake, the second is an
 	// operator deliberately denying everything, and they deserve different errors.
 	Policy *policy.Config `json:"policy"`
+	// Tooldefs pins the tool definitions each protected server is approved to advertise
+	// (SEC-3). Unlike Policy, an ABSENT section is legal and means the check is off: an
+	// unpinned server is one whose tool surface nobody has approved yet, not one nobody may
+	// reach, and denying every server that lacks a pin would make adding the section an
+	// outage. Present-but-empty is still an error, for the same reason it is under policy.
+	Tooldefs *tooldefs.Config `json:"tooldefs,omitempty"`
 }
 
 // Load reads and validates the configuration document at path.
@@ -99,6 +107,9 @@ func Parse(data []byte, name string) (*File, error) {
 	}
 
 	if err := file.Policy.Validate(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", name, err)
+	}
+	if err := file.Tooldefs.Validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", name, err)
 	}
 	return &file, nil

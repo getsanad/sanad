@@ -45,7 +45,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 
 	t.Run("unconfigured is fatal", func(t *testing.T) {
 		clearAuthEnv(t)
-		_, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+		_, _, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err == nil {
 			t.Fatal("want a startup error with no principal authenticator configured, got nil")
 		}
@@ -60,7 +60,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("vc mode names the vc var", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
-		_, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+		_, _, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err == nil || !strings.Contains(err.Error(), "PASSPORT_VC_TRUSTED_ISSUERS") {
 			t.Fatalf("want an error naming PASSPORT_VC_TRUSTED_ISSUERS, got %v", err)
 		}
@@ -69,7 +69,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("dev escape hatch", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_DEV_NO_AUTH", "1")
-		p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+		p, _, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("PASSPORT_DEV_NO_AUTH=1: %v", err)
 		}
@@ -104,7 +104,7 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 	// delegationStage builds the configured pipeline and returns its delegation stage.
 	delegationStage := func(t *testing.T) gateway.Stage {
 		t.Helper()
-		p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+		p, _, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("buildPipeline: %v", err)
 		}
@@ -157,7 +157,7 @@ func TestBuildPipelineWiresTheToolExtractor(t *testing.T) {
 	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
 	t.Setenv("PASSPORT_ALLOW_ALL", "1") // the PDP permits everything: only attenuation can deny
 
-	p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+	p, _, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 	if err != nil {
 		t.Fatalf("buildPipeline: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestBuildPipelineReturnsKillSwitchForProbes(t *testing.T) {
 		} else {
 			t.Setenv("PASSPORT_DEV_NO_AUTH", devNoAuth)
 		}
-		_, ks, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+		_, ks, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("PASSPORT_DEV_NO_AUTH=%q: %v", devNoAuth, err)
 		}
@@ -317,6 +317,18 @@ func policyFile(t *testing.T, content string) string {
 	return path
 }
 
+// configuredPDP does what buildPipeline does to reach the PDP: read the configuration document
+// once, then compile the policy section out of it. Startup errors can come from either half —
+// a file that does not parse, or an allow-all that contradicts one — and both must stop the
+// gateway, so the tests below assert on whichever one fires.
+func configuredPDP() (policy.PDP, error) {
+	file, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	return buildPDP(gateway.NewRegistry(), file)
+}
+
 // decide runs a PDP the way the policy stage does.
 func decide(t *testing.T, pdp policy.PDP, method, tool string) types.Decision {
 	t.Helper()
@@ -340,7 +352,7 @@ func TestBuildPDPFromPolicyFile(t *testing.T) {
 	  }}}
 	}`)
 
-	pdp, err := buildPDP(gateway.NewRegistry())
+	pdp, err := configuredPDP()
 	if err != nil {
 		t.Fatalf("buildPDP: %v", err)
 	}
@@ -369,7 +381,7 @@ func TestBuildPDPFromPolicyFile(t *testing.T) {
 func TestBuildPDPDefaults(t *testing.T) {
 	t.Run("no file denies everything", func(t *testing.T) {
 		clearAuthEnv(t)
-		pdp, err := buildPDP(gateway.NewRegistry())
+		pdp, err := configuredPDP()
 		if err != nil {
 			t.Fatalf("buildPDP: %v", err)
 		}
@@ -381,7 +393,7 @@ func TestBuildPDPDefaults(t *testing.T) {
 	t.Run("allow-all still works for dev", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_ALLOW_ALL", "1")
-		pdp, err := buildPDP(gateway.NewRegistry())
+		pdp, err := configuredPDP()
 		if err != nil {
 			t.Fatalf("buildPDP: %v", err)
 		}
@@ -399,7 +411,7 @@ func TestBuildPDPRejectsAllowAllWithAPolicyFile(t *testing.T) {
 	t.Setenv("PASSPORT_ALLOW_ALL", "1")
 	path := policyFile(t, `{"version":1,"policy":{"servers":{"demo":{"allow":{"tools":["read"]}}}}}`)
 
-	_, err := buildPDP(gateway.NewRegistry())
+	_, err := configuredPDP()
 	if err == nil {
 		t.Fatal("setting both must be a startup error")
 	}
@@ -429,7 +441,7 @@ func TestBuildPDPBrokenFileFailsStartup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clearAuthEnv(t)
 			path := policyFile(t, tc.content)
-			_, err := buildPDP(gateway.NewRegistry())
+			_, err := configuredPDP()
 			if err == nil {
 				t.Fatal("a broken policy file must fail startup")
 			}
@@ -447,7 +459,7 @@ func TestBuildPDPBrokenFileFailsStartup(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_POLICY_FILE", filepath.Join(t.TempDir(), "absent.json"))
-		if _, err := buildPDP(gateway.NewRegistry()); err == nil {
+		if _, err := configuredPDP(); err == nil {
 			t.Fatal("a missing policy file must fail startup, not degrade to no policy")
 		}
 	})
@@ -467,7 +479,7 @@ func TestBuildPipelineWiresTheApprover(t *testing.T) {
 	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
 	policyFile(t, `{"version":1,"policy":{"servers":{"demo":{"review":{"tools":["transfer"]}}}}}`)
 
-	p, _, approver, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+	p, _, approver, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 	if err != nil {
 		t.Fatalf("buildPipeline: %v", err)
 	}
@@ -537,5 +549,97 @@ func TestApprovalTimeout(t *testing.T) {
 				t.Fatalf("got %s, want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- tool-definition pinning (SEC-3) ---------------------------------------------------
+
+// TestBuildPipelineWiresToolDefinitionPinning is the fix for the gap this item names.
+// tooldefs.Check was called by nothing outside its own tests: the package could detect a
+// rug-pull and no code path ever asked it to. It must now be built from the operator's config
+// file, land on the request path as a stage, and land on the RESPONSE path — which is the only
+// place tool definitions are visible at all.
+func TestBuildPipelineWiresToolDefinitionPinning(t *testing.T) {
+	signer, err := sts.NewLocalSigner("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := "sha256:" + strings.Repeat("ab", 32)
+	clearAuthEnv(t)
+	t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
+	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
+	policyFile(t, `{
+	  "version": 1,
+	  "policy":   {"servers": {"demo": {"allow": {"methods": ["tools/list"], "tools": ["read"]}}}},
+	  "tooldefs": {"servers": {"demo": {"note": "approved 2026-07-01", "fingerprint": "`+pin+`"}}}
+	}`)
+
+	p, _, _, guard, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+	if err != nil {
+		t.Fatalf("buildPipeline: %v", err)
+	}
+	if guard == nil {
+		t.Fatal("no guard returned: the pins in the config file would enforce nothing")
+	}
+	if !guard.Watches("demo") {
+		t.Fatal("the pinned server is not watched")
+	}
+	var staged bool
+	for _, s := range p.Stages {
+		if s.Name() == "tooldefs" {
+			staged = true
+		}
+	}
+	if !staged {
+		t.Fatal("the pipeline has no tooldefs stage: a quarantined server would keep serving tool calls")
+	}
+
+	// The response hook is what makes any of it run: drift lives in a tools/list RESPONSE.
+	g := &gateway.Gateway{Registry: gateway.NewRegistry(), Inspect: guard.Inspect}
+	if g.Inspect == nil {
+		t.Fatal("the guard must be usable as a gateway response inspector")
+	}
+}
+
+// TestBuildPipelineWithNoPinsIsInert: pinning is opt-in. A config file with no tooldefs section
+// must produce no guard, no stage and no response inspection at all — the feature costs nothing
+// until an operator approves a tool surface.
+func TestBuildPipelineWithNoPinsIsInert(t *testing.T) {
+	signer, err := sts.NewLocalSigner("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearAuthEnv(t)
+	t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
+	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
+	policyFile(t, `{"version":1,"policy":{"servers":{"demo":{"allow":{"tools":["read"]}}}}}`)
+
+	p, _, _, guard, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+	if err != nil {
+		t.Fatalf("buildPipeline: %v", err)
+	}
+	if guard != nil {
+		t.Fatal("no tooldefs section must mean no guard")
+	}
+	for _, s := range p.Stages {
+		if s.Name() == "tooldefs" {
+			t.Fatal("no tooldefs section must mean no tooldefs stage")
+		}
+	}
+}
+
+// TestBuildToolDefsRejectsABrokenPin: like the policy section, a pin an operator got wrong
+// stops startup naming the file — never a partial load that leaves a server unchecked.
+func TestBuildToolDefsRejectsABrokenPin(t *testing.T) {
+	clearAuthEnv(t)
+	path := policyFile(t, `{
+	  "version": 1,
+	  "policy":   {"servers": {"demo": {"allow": {"tools": ["read"]}}}},
+	  "tooldefs": {"servers": {"demo": {"fingerprint": "not-a-fingerprint"}}}
+	}`)
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("a mistyped pin must fail startup")
+	} else if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "sha256:") {
+		t.Fatalf("error %q must name the file and what a fingerprint looks like", err)
 	}
 }

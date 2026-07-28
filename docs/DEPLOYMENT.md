@@ -98,7 +98,7 @@ Gateway (full list in `cmd/gateway/main.go`):
 | Var | Purpose |
 |---|---|
 | `PASSPORT_SERVERS` | `id=url,id2=url2` protected MCP servers |
-| `PASSPORT_POLICY_FILE` | path to the authorization document: per server, which JSON-RPC methods and tools are allowed and which need a human (see the README). Unset = deny everything. A file that does not parse, or whose rules do not validate, is a **fatal startup error** naming the offending entry — never a partial load |
+| `PASSPORT_POLICY_FILE` | path to the configuration document (see the README). The `policy` section says, per server, which JSON-RPC methods and tools are allowed and which need a human; the optional `tooldefs` section pins each server's approved tool definitions, so a silently rewritten tool description is refused rather than shown to the agent (SEC-3). Unset = deny everything and pin nothing. A file that does not parse, or whose rules or pins do not validate, is a **fatal startup error** naming the offending entry — never a partial load |
 | `PASSPORT_APPROVAL_TIMEOUT` | how long an action held for human approval waits before it is denied (default `2m`; `0` = until the caller disconnects) |
 | `PASSPORT_ADMIN_TOKEN` | bearer token for the review API (`/admin/reviews`) on the gateway. **Unset = the review API is not mounted**, and anything routed to review times out and denies |
 | `PASSPORT_PRINCIPAL_MODE` | `oidc` (default) or `vc` |
@@ -124,6 +124,18 @@ every request and fails `/readyz`. That is deliberate: past the bound the gatewa
 longer promise a revocation has reached it (NFR-4), and a kill-switch that cannot see its
 deny list must stop traffic rather than wave it through. **Alert on the gauge approaching
 the bound** — it goes off long before any request is denied.
+
+### Tool-definition drift
+
+If the configuration document carries a `tooldefs` section (see the README), the gateway checks
+every `tools/list` response from a pinned server against its approved fingerprint. A mismatch is
+audited under the `drift` action — with both fingerprints, the tools observed and the principal
+whose request surfaced it — logged, and exported as
+`agentpassport_tooldefs_quarantined_servers`. **Alert on that gauge being non-zero**: it means a
+protected server is advertising tools nobody approved, and under the default `deny` mode its
+tool calls are already being refused. Take it to zero by reviewing the diff and either rolling
+the server back or re-pinning it; the quarantine lifts by itself on the first `tools/list` that
+matches again, with no restart.
 
 The write side is just as blunt: if `POST /admin/revoke` (or `/admin/restore`) cannot reach
 that database, it answers **503**, never a reassuring 200, with a body naming the ids that

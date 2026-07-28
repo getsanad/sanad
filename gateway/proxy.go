@@ -34,6 +34,11 @@ type Gateway struct {
 	// deliberately no "unlimited" setting, because the buffer is filled before the caller has
 	// been authenticated.
 	MaxRequestBody int64
+	// Inspect is an optional check on the upstream RESPONSE, for the one thing no request-path
+	// stage can see: what the server actually advertises (tool-definition drift, SEC-3). It is
+	// nil by default, and when nil the response path is untouched — see ResponseInspector for
+	// the streaming contract an inspector has to keep.
+	Inspect ResponseInspector
 }
 
 func (g *Gateway) maxRequestBody() int64 {
@@ -136,6 +141,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Strip the /servers/{id} prefix so the upstream sees a clean MCP path.
 	r.URL.Path = upstreamPath
 	r.URL.RawPath = ""
+
+	// Bind this request's response inspector, if any, so the reverse proxy's ModifyResponse can
+	// reach both it and the decided Request (gateway/response.go).
+	if g.Inspect != nil {
+		r = withInspector(r, func(resp *http.Response) error { return g.Inspect(req, resp) })
+	}
 
 	g.audit(req, true, "allow")
 	srv.proxy.ServeHTTP(w, r)

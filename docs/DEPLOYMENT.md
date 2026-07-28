@@ -28,8 +28,9 @@ go run ./cmd/devsecrets --out deploy      # or: make devsecrets
 cd deploy && docker compose up --build    # or, from repo root: make compose-up
 
 # 3. From the repo root, enroll an agent and route a call through the gateway.
-go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token \
-  --key agent.key --out cred.json
+#    The bootstrap token comes from a file, not an argument (step 1 wrote it).
+go run ./cmd/passport enroll --authority http://localhost:8082 \
+  --token-file deploy/secrets/bootstrap.token --key agent.key --out cred.json
 
 PASSPORT_PRINCIPAL_TOKEN=$(cat deploy/secrets/principal.token) \
   go run ./cmd/passport proxy --gateway http://localhost:8080 \
@@ -48,6 +49,22 @@ engine permits everything; remove it and configure policy for anything real.
 To see the shared kill-switch cross a process boundary: `POST /admin/revoke {"ID": "<principal-did>"}`
 to `:8081` (bearer `PASSPORT_ADMIN_TOKEN` from `deploy/.env`); within one refresh interval the
 gateway starts denying that principal.
+
+### When enrollment says the token is spent
+
+Bootstrap tokens are **single-use and expiring** — by default one enrollment within 15
+minutes. `devsecrets` widens that for the dev loop (`PASSPORT_BOOTSTRAP_USES=25`,
+`PASSPORT_BOOTSTRAP_TTL=24h` in `deploy/.env`) so you can re-enroll all day, but the budget is
+finite and it is held **in the authority process**. When you hit it:
+
+```bash
+cd deploy && docker compose restart authority   # re-reads .env, full budget, fresh window
+```
+
+Because the budget lives in that one process, restarting the authority reissues it — and a
+second authority replica would honour the same token again with counters of its own. That is
+the bootstrap-token path being what it is: a dev/self-host convenience. Production uses
+measured attestation (below), where nothing is spent and there is no shared secret to budget.
 
 ## Production shape (ECS / Kubernetes)
 
@@ -113,6 +130,31 @@ Gateway (full list in `cmd/gateway/main.go`):
 | `PASSPORT_REVOCATION_MAX_STALENESS` | snapshot age past which revocation checks **deny** and `/readyz` reports unready (default 60s, the NFR-4 target); must exceed the refresh interval |
 | `PASSPORT_ALLOW_ALL` | `1` permits everything (**dev only**) |
 | `PASSPORT_DEV_NO_AUTH` | `1` starts without principal auth (**dev only**); otherwise a missing principal authenticator is a fatal startup error |
+
+Authority (full list in `cmd/authority/main.go`):
+
+| Var | Purpose |
+|---|---|
+| `PASSPORT_CA_KEY` | base64url Ed25519 workload CA private key. Its public half is the gateway's `PASSPORT_WORKLOAD_CA`. Unset = an ephemeral one is generated and printed (**dev only**) |
+| `PASSPORT_BOOTSTRAP_TOKENS` | `token=agentID,token2=agentID2` — the accepted bootstrap tokens (**dev/self-host**). An `agentID` is a local name; principal ids (`did:key:…`, an OIDC subject) are a separate namespace and are refused at startup |
+| `PASSPORT_BOOTSTRAP_USES` | enrollments each token authorizes (default `1`). A token is **spent as it is used** |
+| `PASSPORT_BOOTSTRAP_TTL` | how long each token stays usable, measured from process start (default `15m`) |
+| `PASSPORT_CREDENTIAL_TTL` | issued credential lifetime (default `1h`) |
+
+Both bootstrap counters are **process-local**: restarting the authority re-registers every
+token with a full budget and a fresh window, and each replica counts separately, so N
+replicas honour a single-use token N times. Run one authority process on this path — and for
+anything beyond dev/self-host, run `workload.MeasuredAttestor` or SPIFFE instead, which prove
+identity with a platform-signed quote and have no shared secret to budget in the first place.
+
+`/enroll` and `/enroll/nonce` are unauthenticated (proving who you are is what they are for),
+so both are rate limited together, per client and overall, with a fixed-memory limiter — over
+budget is `429` with a `Retry-After`. The defaults (20/min per client, 200/min overall) hold
+outstanding nonces well under the authority's cap; a fleet that rolls hundreds of instances at
+once raises them with `workload.Authority.SetEnrollLimit`. The limiter keys on the peer
+address and deliberately ignores `X-Forwarded-For`, so behind a load balancer every caller
+shares one client bucket and the global bound is the one doing the work — set per-agent limits
+at the edge, where the peer address is real.
 
 The `PASSPORT_REVOCATION_DSN` must point every gateway replica **and** the admin service at
 the same database for the kill-switch to be global.

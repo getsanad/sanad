@@ -30,8 +30,22 @@ import (
 )
 
 const (
-	agentID       = "agent-1"
-	bootstrapToks = "dev-token=agent-1"
+	agentID   = "agent-1"
+	devToken  = "dev-token"
+	tokenSpec = devToken + "=" + agentID
+
+	// Bootstrap tokens are single-use and short-lived by default (workload.DefaultTokenUses /
+	// DefaultTokenTTL), which is right for a deployment and wrong for a laptop: enrolling once
+	// and then finding the token spent — after `docker compose up`, a coffee, and a credential
+	// that expired in the meantime — is the kind of thing you conclude is broken.
+	//
+	// So the dev stack asks for a budget out loud, in .env, where it is visible next to the
+	// token rather than hidden in a default. 25 enrollments over 24h covers a day of restarting
+	// the agent; past either bound, restarting the authority reissues the whole budget
+	// (`docker compose restart authority`), because the counters are process-local. That
+	// escape hatch is exactly why this attestor is not for production.
+	devTokenUses = "25"
+	devTokenTTL  = "24h"
 )
 
 func main() {
@@ -88,11 +102,19 @@ PASSPORT_WORKLOAD_CA=%s
 PASSPORT_SIGNING_KEY=%s
 PASSPORT_VC_TRUSTED_ISSUERS=%s
 PASSPORT_BOOTSTRAP_TOKENS=%s
+# A bootstrap token defaults to ONE enrollment within 15 minutes. These widen it for the dev
+# loop only; a real deployment leaves them unset (and uses attestation, not tokens at all).
+# The budget is held in the authority process: `+"`docker compose restart authority`"+` reissues it.
+PASSPORT_BOOTSTRAP_USES=%s
+PASSPORT_BOOTSTRAP_TTL=%s
 PASSPORT_ADMIN_TOKEN=%s
-`, b64(caPriv), b64(caPub), b64(seed), issuerDID, bootstrapToks, hex.EncodeToString(adminTok))
+`, b64(caPriv), b64(caPub), b64(seed), issuerDID, tokenSpec, devTokenUses, devTokenTTL, hex.EncodeToString(adminTok))
 
 	writeFile(filepath.Join(*out, ".env"), []byte(env), 0o600)
 	writeFile(filepath.Join(secretsDir, "principal.token"), []byte(principalToken), 0o600)
+	// The bootstrap token goes in a file rather than into the enroll command line: an argument
+	// is readable by every process on the host and is kept in shell history.
+	writeFile(filepath.Join(secretsDir, "bootstrap.token"), []byte(devToken), 0o600)
 	// The credential alone authenticates nothing: the gateway also requires a per-request
 	// proof of possession of the principal's key (vc.HolderProof), which the sidecar builds
 	// from this file. Nothing else in the stack ever sees it.
@@ -105,22 +127,28 @@ Wrote dev secrets to %q:
   secrets/principal.token  -> the principal's VC (presented as the bearer token)
   secrets/principal.key    -> the principal's did:key PRIVATE key; the sidecar proves
                               possession of it on every request (holder binding)
+  secrets/bootstrap.token  -> the agent's bootstrap token, for "enroll --token-file"
   secrets/delegation.json  -> delegation chain principal -> %s (scope: read)
 
 Identities:
   VC issuer (trusted) : %s
   Principal           : %s
-  Agent id            : %s   (bootstrap token: dev-token)
+  Agent id            : %s   (bootstrap token in secrets/bootstrap.token)
 
 Next:
   cd %s && docker compose up --build
   # then, from the repo root, in another shell:
-  go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token --key agent.key --out cred.json
+  go run ./cmd/passport enroll --authority http://localhost:8082 \
+    --token-file %s/secrets/bootstrap.token --key agent.key --out cred.json
   PASSPORT_PRINCIPAL_TOKEN=$(cat %s/secrets/principal.token) \
     go run ./cmd/passport proxy --gateway http://localhost:8080 --key agent.key --credential cred.json \
       --principal-key %s/secrets/principal.key --delegation %s/secrets/delegation.json &
   curl -s localhost:7070/servers/demo/tools/list | jq .
-`, *out, agentID, issuerDID, principalDID, agentID, *out, *out, *out, *out)
+
+The bootstrap token is good for %s enrollments over %s (DEV settings, in .env; the default is
+one enrollment over 15m). When it runs out: "docker compose restart authority" — the budget
+lives in that process — or re-run this command for a fresh stack.
+`, *out, agentID, issuerDID, principalDID, agentID, *out, *out, *out, *out, *out, devTokenUses, devTokenTTL)
 }
 
 func writeFile(path string, b []byte, mode os.FileMode) {

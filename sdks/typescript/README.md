@@ -34,6 +34,8 @@ const key = generateInstanceKey();
 //    Persist key.privateKey somewhere safe (e.g. a file, mode 0600).
 
 // 2. Enroll: present a bootstrap token + your public key, get a workload credential.
+//    Bootstrap tokens are single-use and expiring — call this ONCE, at startup, and read
+//    the token from a file or the environment (never a command-line argument).
 const { credential, agentId, notAfter } = await enroll({
   authorityUrl: 'https://authority.example.com',
   bootstrapToken: process.env.PASSPORT_BOOTSTRAP_TOKEN!,
@@ -160,6 +162,13 @@ nonce from `${authorityUrl}/enroll/nonce`, then `POST`
 both the nonce and the public key. On HTTP 200 returns the **raw credential JSON text**
 in `credential` (plus `agentId` / `notAfter` parsed out for convenience). Throws on any
 non-200, including the status and response body.
+
+A bootstrap token authorizes a bounded number of enrollments (one, by default) inside a
+bounded window, so **enroll once per token, at startup**, and persist the credential.
+`403 … bootstrap token … is spent` / `… expired` is permanent — retrying will not help;
+get a fresh token. `429 … enrollment rate limit exceeded` is not permanent: the authority
+rate-limits both enrollment legs together and sends a `Retry-After` header. Back off for
+that long rather than retrying immediately, or you will stay over budget.
 
 ### `class PassportClient`
 Constructed with `{ gatewayUrl, instanceKey, credential, principalKey?, delegation?, fetch? }`.

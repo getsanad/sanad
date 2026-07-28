@@ -159,9 +159,17 @@ func TestKeyStore(t *testing.T) {
 		t.Fatal("an empty principal id must not register a key")
 	}
 
-	// An expired credential is not cached.
+	// An expired credential is not cached. A second bootstrap token, because the first is spent:
+	// without this the enrollment below fails and Add would be handed a zero Credential, which
+	// it also refuses — passing the test for the wrong reason.
+	if err := att.Register("t2", "agent-1"); err != nil {
+		t.Fatal(err)
+	}
 	expAuth, _ := NewAuthority(caPriv, "ca-1", att, time.Nanosecond)
-	expCred, _ := enroll(t, expAuth, "t", pub)
+	expCred, err := enroll(t, expAuth, "t2", pub)
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
 	time.Sleep(time.Millisecond)
 	if err := ks.Add(expCred); err == nil {
 		t.Fatal("expired credential must not be added")

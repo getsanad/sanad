@@ -35,7 +35,8 @@ def main() -> None:
     #       f.write(key["private_key"])
 
     # 2) Enroll: present the bootstrap token + public key, receive a short-lived
-    #    workload credential. The raw credential text is kept verbatim.
+    #    workload credential. The raw credential text is kept verbatim. Once per token:
+    #    bootstrap tokens are single-use and expiring.
     if os.environ.get("RUN_NETWORK") == "1":
         result = enroll(authority_url, bootstrap_token, key["public_key"])
         print("enrolled as:", result["agent_id"], "expires:", result["not_after"])

@@ -360,7 +360,12 @@ export function principalHolderProof(principalKey: string, input: ProofInput): s
 export interface EnrollOptions {
   /** Authority base URL. A trailing slash is trimmed before appending `/enroll`. */
   authorityUrl: string;
-  /** Bootstrap attestation token (dev/self-host attestor). */
+  /**
+   * Bootstrap attestation token (dev/self-host attestor). Single-use and expiring: it
+   * authorizes a bounded number of enrollments (one, by default) inside a bounded window.
+   * Read it from a file or the environment — never a command-line argument, which is
+   * readable by every process on the host.
+   */
   bootstrapToken: string;
   /** base64url of the 32-byte instance public key (from `generateInstanceKey`/`publicKeyOf`). */
   publicKey: string;
@@ -444,6 +449,11 @@ export async function requestNonce(
  *
  * On HTTP 200 the response body is kept as the raw credential text. On any non-200
  * status this throws an Error including the status and response body.
+ *
+ * Call it once, at startup, and persist the credential: the bootstrap token is single-use
+ * and expiring. A 403 naming a spent or expired token is permanent — a retry cannot fix it,
+ * only a fresh token can. A 429 is the authority's enrollment rate limit and carries a
+ * `Retry-After`; wait that long rather than retrying immediately.
  */
 export async function enroll(opts: EnrollOptions): Promise<EnrollResult> {
   const doFetch = opts.fetch ?? fetch;

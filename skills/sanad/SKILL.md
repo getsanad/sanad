@@ -26,7 +26,10 @@ You do **not** build these by hand. Use one of the two paths below.
 ## What you need from the operator
 - **Gateway URL** (e.g. `https://gw.example.com`)
 - **Authority URL** for enrollment (e.g. `https://authority.example.com`)
-- **Bootstrap token** — proves to the authority which agent id you are
+- **Bootstrap token** — proves to the authority which agent id you are. It is **single-use and
+  expiring**: one token buys one enrollment (unless your operator says otherwise), inside a
+  short window. Ask for it as a **file**, and never put it on a command line — argv is readable
+  by every process on the host and your shell writes it to history.
 - **Principal token** — the caller identity you act on behalf of (OIDC bearer, or a VC token)
 - **Principal key** — with a VC, the `did:key` private key of the credential's subject. The
   gateway requires a per-request proof of possession of it; without the key the credential
@@ -40,7 +43,9 @@ agent's request-building changes.
 
 ```bash
 # 1. Enroll: generate an instance key and exchange the bootstrap token for a credential.
-passport enroll --authority "$AUTHORITY_URL" --token "$BOOTSTRAP_TOKEN" \
+#    Run this ONCE — the token is single-use. Pass it by file (or `--token-file -` to pipe it
+#    in, or $PASSPORT_BOOTSTRAP_TOKEN); there is no --token flag.
+passport enroll --authority "$AUTHORITY_URL" --token-file bootstrap.token \
   --key agent.key --out cred.json
 
 # 2. Run the sidecar. It injects the headers above and forwards to the gateway.
@@ -91,11 +96,19 @@ console.log(resp.status, await resp.text());
 ```
 
 Persist `agent.key` / the private key and re-enroll when the credential nears expiry (they're
-short-lived by design).
+short-lived by design). Re-enrolling needs budget on your bootstrap token — ask your operator
+for one with enough uses to cover your restart and renewal rate, or for a fresh token each
+time. Don't paper over `bootstrap token … is spent` by retrying; it will not start working.
 
 ## Troubleshooting (the gateway fails closed, so a rejection is normal and informative)
 - **`401/403 … missing instance credential` or `bad credential signature`** — enroll again; the
   credential may be expired or the gateway trusts a different CA than issued it.
+- **`enrollment denied: … bootstrap token … is spent` / `… expired`** — the token authorized a
+  bounded number of enrollments inside a bounded window and you are past one of them. This is
+  not transient: ask the operator for a fresh token (or, on a local stack, restart the
+  authority — the budget lives in that process).
+- **`429 … enrollment rate limit exceeded`** — the authority rate-limits enrollment. Honour the
+  `Retry-After` header and back off; do not retry in a tight loop.
 - **`… instance proof of possession failed`** — the `agent.key` you're signing with doesn't
   match the credential's public key. Re-run enroll so the key and credential are a matched pair.
 - **`revocation: … is revoked`** — your principal, agent, or blueprint is on the kill-switch.

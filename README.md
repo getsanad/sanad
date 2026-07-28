@@ -219,8 +219,8 @@ Then enroll an agent and route a call through the gateway (the upstream echoes b
 minted passport — note it is **not** your principal token):
 
 ```sh
-go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token \
-  --key agent.key --out cred.json
+go run ./cmd/passport enroll --authority http://localhost:8082 \
+  --token-file deploy/secrets/bootstrap.token --key agent.key --out cred.json
 PASSPORT_PRINCIPAL_TOKEN=$(cat deploy/secrets/principal.token) \
   go run ./cmd/passport proxy --gateway http://localhost:8080 \
     --key agent.key --credential cred.json \
@@ -254,7 +254,10 @@ the deployment sets `PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act d
   The agent points its MCP client at a local proxy that injects all the credentials for it:
   ```sh
   # operator runs the authority (issues credentials):  make run-authority
-  passport enroll --authority https://authority.example.com --token <bootstrap-token>
+  # The bootstrap token comes from a file or the environment, never an argument — argv is
+  # readable by every process on the host and lands in shell history. It is single-use and
+  # expiring: one token, one enrollment, at startup.
+  passport enroll --authority https://authority.example.com --token-file bootstrap.token
   # --principal-key is required by gateways in VC mode; omit it in OIDC mode.
   passport proxy  --gateway   https://gw.example.com --key agent.key --credential cred.json \
                   --principal-key principal.key --delegation chain.json

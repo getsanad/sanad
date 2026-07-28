@@ -454,8 +454,16 @@ def enroll(authority_url: str, bootstrap_token: str, public_key: str) -> Dict[st
     On HTTP 200 the response body is the credential JSON, kept verbatim (its embedded
     signature must not be re-serialized).
 
+    Call this once, at startup, and persist the credential: a bootstrap token is
+    single-use and expiring — it authorizes a bounded number of enrollments (one, by
+    default) inside a bounded window. A 403 naming a spent or expired token is
+    permanent and retrying cannot fix it; a 429 is the authority's enrollment rate
+    limit and carries a ``Retry-After`` header to wait for.
+
     :param authority_url: base URL of the authority service.
-    :param bootstrap_token: attestation bootstrap token (opaque string).
+    :param bootstrap_token: attestation bootstrap token (opaque string). Read it from a
+        file or the environment, never a command-line argument — argv is readable by
+        every process on the host.
     :param public_key: base64url of the 32-byte instance public key.
     :returns: ``{"credential": <raw text>, "agent_id": ..., "not_after": ...}``.
     :raises EnrollmentError: on a non-200 response.

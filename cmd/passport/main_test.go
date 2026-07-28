@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -206,5 +208,63 @@ func TestTokenSourceFromEnv(t *testing.T) {
 	}
 	if _, err := tokenSource("", "PASSPORT_MISSING_VAR")(); err == nil {
 		t.Fatal("missing token env must error")
+	}
+}
+
+// TestReadSecretSources covers the ways a bootstrap token may be supplied now that it is not
+// an argv flag: a file, stdin, or an environment variable.
+func TestReadSecretSources(t *testing.T) {
+	// A file, with the trailing newline every editor and `echo` adds.
+	path := filepath.Join(t.TempDir(), "bootstrap.token")
+	if err := os.WriteFile(path, []byte("dev-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readSecret(path, "PASSPORT_UNUSED_VAR"); err != nil || got != "dev-token" {
+		t.Fatalf("token from file: %q, %v", got, err)
+	}
+
+	// The env var, used only when no file is given.
+	t.Setenv("PASSPORT_BOOTSTRAP_TOKEN", "env-token")
+	if got, err := readSecret("", "PASSPORT_BOOTSTRAP_TOKEN"); err != nil || got != "env-token" {
+		t.Fatalf("token from env: %q, %v", got, err)
+	}
+	if got, err := readSecret(path, "PASSPORT_BOOTSTRAP_TOKEN"); err != nil || got != "dev-token" {
+		t.Fatalf("a file must win over the env var: %q, %v", got, err)
+	}
+
+	// An empty source is an error rather than an empty token, which would go to the authority
+	// as evidence keyed by "" and be refused there with a far less useful message.
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSecret(empty, "PASSPORT_UNUSED_VAR"); err == nil {
+		t.Fatal("an empty token file must error")
+	}
+	if _, err := readSecret("", "PASSPORT_UNUSED_VAR"); err == nil {
+		t.Fatal("an unset token env var must error")
+	}
+	if _, err := readSecret(filepath.Join(t.TempDir(), "nope"), "PASSPORT_UNUSED_VAR"); err == nil {
+		t.Fatal("a missing token file must error")
+	}
+}
+
+// TestReadSecretFromStdin covers `--token-file -`, the form that keeps the token out of both
+// argv and the environment.
+func TestReadSecretFromStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = orig }()
+
+	go func() {
+		_, _ = w.WriteString("piped-token\n")
+		w.Close()
+	}()
+	if got, err := readSecret("-", "PASSPORT_UNUSED_VAR"); err != nil || got != "piped-token" {
+		t.Fatalf("token from stdin: %q, %v", got, err)
 	}
 }

@@ -33,10 +33,18 @@ type enrollRequest struct {
 
 // NonceHandler serves the first leg of enrollment: it mints the single-use challenge the
 // agent's attestation evidence must cover. Mount at POST /enroll/nonce on the authority.
+//
+// It is rate limited on the same budget as EnrollHandler (Authority.SetEnrollLimit). This is
+// the leg that costs memory — every nonce it hands out sits in the authority's table for
+// NonceTTL — so an unlimited nonce endpoint is a way to refuse honest agents a challenge
+// without ever attempting an enrollment.
 func NonceHandler(a *Authority) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if rateLimited(a.limiter, w, r) {
 			return
 		}
 		nonce, err := a.Nonce()
@@ -56,10 +64,18 @@ func NonceHandler(a *Authority) http.Handler {
 // attestation evidence and its instance public key, and — if the evidence attests to that
 // nonce and that key — receives a signed, short-lived workload credential. Mount at
 // POST /enroll on the authority service.
+//
+// It is unauthenticated by construction (proving who you are is what it is for), so it is rate
+// limited: a caller over budget gets 429 with a Retry-After before anything is decoded, and
+// cannot grind attestation attempts — with a TokenAttestor each attempt costs one HMAC per
+// registered token — or spend the authority's nonces faster than it issues them.
 func EnrollHandler(a *Authority) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if rateLimited(a.limiter, w, r) {
 			return
 		}
 		var req enrollRequest

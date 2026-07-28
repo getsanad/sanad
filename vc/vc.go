@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -78,7 +79,7 @@ func Issue(issuerDID string, issuerKey ed25519.PrivateKey, subject Subject, ttl 
 	if err != nil {
 		return Credential{}, err
 	}
-	c.Proof.ProofValue = base64.RawURLEncoding.EncodeToString(ed25519.Sign(issuerKey, msg))
+	c.Proof.ProofValue = base64.RawURLEncoding.EncodeToString(sigctx.Sign(sigctx.VCProof, issuerKey, msg))
 	return c, nil
 }
 
@@ -103,7 +104,7 @@ func Verify(c Credential, trust TrustStore, now time.Time) (Subject, error) {
 	if err != nil {
 		return Subject{}, err
 	}
-	if !ed25519.Verify(issuerPub, msg, sig) {
+	if !sigctx.Verify(sigctx.VCProof, issuerPub, msg, sig) {
 		return Subject{}, errors.New("vc: signature verification failed")
 	}
 
@@ -130,7 +131,10 @@ func Verify(c Credential, trust TrustStore, now time.Time) (Subject, error) {
 	return c.Subject, nil
 }
 
-// canonical is the deterministic signing input: the credential with an empty proofValue.
+// canonical is the deterministic signing input: the credential with an empty proofValue. It
+// is signed under sigctx.VCProof, so an issuer key that is also a principal key (it vouches
+// for did:key subjects, and did:key principals root delegation chains) cannot have one of its
+// signatures read as the other kind.
 func canonical(c Credential) ([]byte, error) {
 	c.Proof.ProofValue = "" // value copy; does not affect the caller
 	return json.Marshal(c)

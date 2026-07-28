@@ -15,6 +15,9 @@
  *   - All base64 is RFC 4648 URL-safe with NO padding (Go's base64.RawURLEncoding,
  *     Node's `buf.toString('base64url')`). Decoding tolerates missing padding.
  *   - Cryptography is Ed25519.
+ *   - Every signature is domain-separated: it is made over
+ *     `uint64be(ctx.length) || ctx || message`, where `ctx` names what is being signed
+ *     (see `sigctxMessage`). Signing the bare message is NOT accepted by the gateway.
  *   - Enrolling is two requests: fetch a single-use nonce from the authority, then
  *     present attestation evidence covering both that nonce and the public key being
  *     enrolled. That binding is what stops an enrollment captured off the wire from
@@ -63,6 +66,35 @@ function b64urlDecode(s: string): Buffer {
 /** Encode a UTF-8 string as base64url. */
 function b64urlUtf8(s: string): string {
   return Buffer.from(s, 'utf8').toString('base64url');
+}
+
+// ---------------------------------------------------------------------------
+// Domain separation
+// ---------------------------------------------------------------------------
+
+/**
+ * Context label for an instance proof of possession. Mirrors Go's
+ * `sigctx.InstanceProof`.
+ */
+export const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v1';
+
+/**
+ * Build the domain-separated signing input Go's `sigctx.Message` produces:
+ *
+ *     uint64be(ctx.length) || utf8(ctx) || message
+ *
+ * The 8-byte big-endian length prefix is what makes the encoding unambiguous — it
+ * fixes exactly where the label ends, so the bytes parse back to one (ctx, message)
+ * pair and no label can be read as the head of a message. The instance key signs
+ * more than one kind of thing (it proves possession here, and authenticates the
+ * delegation hops the agent signs), and the label is what keeps a signature made
+ * for one from being accepted as the other.
+ */
+export function sigctxMessage(ctx: string, message: Buffer | Uint8Array): Buffer {
+  const label = Buffer.from(ctx, 'utf8');
+  const prefix = Buffer.alloc(8);
+  prefix.writeBigUInt64BE(BigInt(label.length));
+  return Buffer.concat([prefix, label, Buffer.from(message)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,12 +167,17 @@ export function publicKeyOf(privateKey: string): string {
 
 /**
  * Produce the proof of possession for a principal token: base64url of the Ed25519
- * signature, made with the instance private key, over the UTF-8 bytes of the token.
- * Matches Go's `workload.Proof`.
+ * signature, made with the instance private key, over the domain-separated signing
+ * input for the token under `CTX_INSTANCE_PROOF`. Matches Go's `workload.Proof`.
+ *
+ * Signing the bare token — as this SDK did before the context was introduced — turns
+ * the instance key into a signing oracle for anything else that key authenticates,
+ * so the gateway rejects such a signature.
  */
 export function proof(privateKey: string, principalToken: string): string {
   const priv = privateKeyObjectFromSeed(seedFromPrivateKey(privateKey));
-  const sig = sign(null, Buffer.from(principalToken, 'utf8'), priv);
+  const msg = sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from(principalToken, 'utf8'));
+  const sig = sign(null, msg, priv);
   return b64url(sig);
 }
 

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // SignedCheckpoint is a signed commitment to the log at a point in time: its size and
@@ -91,7 +93,7 @@ func (l *TransparencyLog) PublicKey() ed25519.PublicKey {
 func (l *TransparencyLog) Checkpoint() SignedCheckpoint {
 	leaves := l.snapshot()
 	cp := SignedCheckpoint{Size: len(leaves), Root: Root(leaves), KeyID: l.kid}
-	cp.Signature = ed25519.Sign(l.signer, checkpointMsg(cp))
+	cp.Signature = sigctx.Sign(sigctx.AuditCheckpoint, l.signer, checkpointMsg(cp))
 	return cp
 }
 
@@ -111,9 +113,11 @@ func (l *TransparencyLog) ConsistencyProof(oldSize int) ([][]byte, error) {
 	return ConsistencyProof(l.snapshot(), oldSize)
 }
 
-// VerifyCheckpoint checks a checkpoint's operator signature.
+// VerifyCheckpoint checks a checkpoint's operator signature. A witness co-signature over the
+// same checkpoint is made under a different context and is rejected here, so co-signatures
+// cannot be passed off as the operator's own commitment (and vice versa).
 func VerifyCheckpoint(pub ed25519.PublicKey, cp SignedCheckpoint) bool {
-	return ed25519.Verify(pub, checkpointMsg(cp), cp.Signature)
+	return sigctx.Verify(sigctx.AuditCheckpoint, pub, checkpointMsg(cp), cp.Signature)
 }
 
 func checkpointMsg(cp SignedCheckpoint) []byte {

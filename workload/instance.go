@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -46,8 +47,15 @@ func DecodeCredential(s string) (Credential, error) {
 // Proof produces the proof of possession an instance presents: a signature, with its
 // instance key, over the principal bearer token it is using. This binds the instance to
 // that specific (short-lived) principal credential.
+//
+// The signature is domain-separated (sigctx.InstanceProof). It must be: the same instance
+// key is registered in the KeyStore and authenticates the delegation hops this agent signs,
+// so an untagged signature over a caller-supplied token is a signing oracle for hops — hand
+// it the exact bytes of a hop's canonical encoding and the proof comes back as a valid
+// delegation from that agent.
 func Proof(instanceKey ed25519.PrivateKey, principalToken string) string {
-	return base64.RawURLEncoding.EncodeToString(ed25519.Sign(instanceKey, []byte(principalToken)))
+	return base64.RawURLEncoding.EncodeToString(
+		sigctx.Sign(sigctx.InstanceProof, instanceKey, []byte(principalToken)))
 }
 
 // InstanceStage authenticates the calling agent instance (PRD FR-5) from a presented
@@ -83,7 +91,7 @@ func InstanceStage(caPub ed25519.PublicKey, store *KeyStore) gateway.Stage {
 		if err != nil {
 			return fmt.Errorf("workload: bad proof encoding: %w", err)
 		}
-		if !ed25519.Verify(cred.PublicKey, []byte(token), proof) {
+		if !sigctx.Verify(sigctx.InstanceProof, cred.PublicKey, []byte(token), proof) {
 			return errors.New("workload: instance proof of possession failed")
 		}
 

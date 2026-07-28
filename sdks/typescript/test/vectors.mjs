@@ -2,7 +2,8 @@
 // vectors match the Go implementation byte-for-byte. Run with:  node test/vectors.mjs
 //
 // This mirrors the logic in src/index.ts using only node:crypto so the fixed vectors
-// can be verified in any environment, even without tsc/tsx installed.
+// can be verified in any environment, even without tsc/tsx installed. The same values are
+// pinned Go-side in workload/interop_test.go — update all three suites together.
 import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 
@@ -29,8 +30,20 @@ function rawPub(priv) {
 function publicKeyOf(b64) {
   return rawPub(privObj(seedFromPrivateKey(b64))).toString('base64url');
 }
+// Domain-separated signing input, matching Go's sigctx.Message:
+// uint64be(ctx.length) || ctx || message. The length prefix fixes where the label ends,
+// so no label can be read as the head of a message (or the reverse).
+function sigctxMessage(ctx, message) {
+  const label = Buffer.from(ctx, 'utf8');
+  const prefix = Buffer.alloc(8);
+  prefix.writeBigUInt64BE(BigInt(label.length));
+  return Buffer.concat([prefix, label, Buffer.from(message)]);
+}
+const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v1';
+
 function proof(b64, token) {
-  return crypto.sign(null, Buffer.from(token, 'utf8'), privObj(seedFromPrivateKey(b64))).toString('base64url');
+  const msg = sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from(token, 'utf8'));
+  return crypto.sign(null, msg, privObj(seedFromPrivateKey(b64))).toString('base64url');
 }
 // The evidence a Go workload.TokenAttestor accepts: HMAC-SHA256 keyed by the bootstrap
 // token over the canonical JSON of {ctx, nonce, pub}, with the byte fields in standard
@@ -47,7 +60,9 @@ function bootstrapEvidence(token, nonce, pub) {
 const SEED = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA';
 const FULL = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA';
 const PUB = 'ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ';
-const PROOF = 'vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ';
+const PROOF = '_xyI6J0jruF9VJx5RZimoWtBtrH_7lFTueCgCdeSllnwDcTP5bxCQ9ponOj9OZSbidfO-89TiuC8QYwKBYmlDw';
+// The signing input the proof covers, as hex: 8-byte length || context || token.
+const PROOF_INPUT_HEX = '000000000000001773616e61642f696e7374616e63652d70726f6f662f7631746573742d7072696e636970616c2d746f6b656e';
 const CRED = '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","IssuedAt":"2026-07-10T00:00:00Z","NotAfter":"2026-07-10T01:00:00Z","KeyID":"ca-1","Signature":"AA=="}';
 const CRED_HEADER = 'eyJBZ2VudElEIjoiYWdlbnQtMSIsIlB1YmxpY0tleSI6IjNiNmEyN2JjY2ViNmE0MmQ2MmEzYThkMDJhNmYwZDczNjUzMjE1NzcxZGUyNDNhNjNhYzA0OGExOGI1OWRhMjkiLCJJc3N1ZWRBdCI6IjIwMjYtMDctMTBUMDA6MDA6MDBaIiwiTm90QWZ0ZXIiOiIyMDI2LTA3LTEwVDAxOjAwOjAwWiIsIktleUlEIjoiY2EtMSIsIlNpZ25hdHVyZSI6IkFBPT0ifQ';
 const NONCE = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
@@ -57,6 +72,7 @@ const results = [
   ['publicKeyOf(seed)', publicKeyOf(SEED), PUB],
   ['64-byte form b64url', Buffer.concat([Buffer.from(SEED, 'base64url'), Buffer.from(PUB, 'base64url')]).toString('base64url'), FULL],
   ['publicKeyOf(64-byte form)', publicKeyOf(FULL), PUB],
+  ['sigctxMessage(instance-proof, token)', sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from('test-principal-token', 'utf8')).toString('hex'), PROOF_INPUT_HEX],
   ['proof(seed, "test-principal-token")', proof(SEED, 'test-principal-token'), PROOF],
   ['proof(64-byte form) == proof(seed)', proof(FULL, 'test-principal-token'), PROOF],
   ['base64url(utf8(credential))', Buffer.from(CRED, 'utf8').toString('base64url'), CRED_HEADER],

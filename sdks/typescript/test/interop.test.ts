@@ -2,15 +2,22 @@
  * Interop tests. These lock the byte formats against fixed vectors generated from the
  * Go implementation, so any drift in the wire format is caught immediately.
  *
+ * The same values are pinned Go-side in workload/interop_test.go, which is what CI runs;
+ * changing one without the other is a wire break. Update all three suites together.
+ *
  * Run with:  node --test test/        (Node >= 22.6 strips the TS types automatically)
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { sign as edSign, createPrivateKey } from 'node:crypto';
+
 import {
   generateInstanceKey,
   publicKeyOf,
   proof,
+  sigctxMessage,
+  CTX_INSTANCE_PROOF,
   bootstrapEvidence,
   requestNonce,
   enroll,
@@ -26,8 +33,9 @@ const SEED_B64URL = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA';
 const FULL_B64URL =
   'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA';
 const EXPECTED_PUB = 'ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ';
+// The proof is over the domain-separated signing input, not the bare token.
 const EXPECTED_PROOF =
-  'vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ';
+  '_xyI6J0jruF9VJx5RZimoWtBtrH_7lFTueCgCdeSllnwDcTP5bxCQ9ponOj9OZSbidfO-89TiuC8QYwKBYmlDw';
 
 // Enrollment nonce 0x00..0x1f, and the bootstrap evidence Go's workload.BootstrapEvidence
 // produces for it with token "boot-token" and EXPECTED_PUB.
@@ -49,6 +57,40 @@ test('publicKeyOf matches the fixed vector', () => {
 
 test('proof matches the fixed vector', () => {
   assert.equal(proof(SEED_B64URL, 'test-principal-token'), EXPECTED_PROOF);
+});
+
+test('sigctxMessage produces the length-prefixed layout Go signs', () => {
+  const got = sigctxMessage('abc', Buffer.from('xy', 'utf8'));
+  assert.equal(got.toString('hex'), '0000000000000003' + Buffer.from('abcxy').toString('hex'));
+  // The length prefix is what disambiguates the split between label and message.
+  assert.notEqual(
+    sigctxMessage('ab', Buffer.from('c')).toString('hex'),
+    sigctxMessage('a', Buffer.from('bc')).toString('hex'),
+  );
+});
+
+test('proof signs the domain-separated input, not the bare token', () => {
+  const PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex');
+  const priv = createPrivateKey({
+    key: Buffer.concat([PKCS8, Buffer.from(SEED_B64URL, 'base64url')]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const token = 'test-principal-token';
+
+  // The pre-domain-separation form: a raw signature over the token bytes. It must NOT be
+  // what the SDK sends — the gateway rejects it, because that signature would equally be
+  // a delegation hop signed by the same instance key.
+  const bare = edSign(null, Buffer.from(token, 'utf8'), priv).toString('base64url');
+  assert.notEqual(proof(SEED_B64URL, token), bare);
+
+  // And the proof is exactly a signature over sigctxMessage(CTX_INSTANCE_PROOF, token).
+  const tagged = edSign(
+    null,
+    sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from(token, 'utf8')),
+    priv,
+  ).toString('base64url');
+  assert.equal(proof(SEED_B64URL, token), tagged);
 });
 
 test('base64url(utf8(credential)) matches the fixed vector', () => {

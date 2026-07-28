@@ -1,18 +1,20 @@
 package delegation
 
 import (
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // Verify checks the whole chain and returns the effective (most-narrowed) grant and the
 // acting agent (the final delegate). It enforces, for every hop:
 //   - the root delegator is the accountable principal (rootPrincipalID);
 //   - continuity: each delegator holds the delegation from the previous hop;
-//   - a valid signature by the delegator's registered key (FR-13 — an unverifiable hop is
-//     rejected, never trusted);
+//   - a valid signature by the delegator's registered key, made under the delegation-hop
+//     context (FR-13 — an unverifiable hop is rejected, never trusted, and a signature that
+//     key made for some other purpose is not a hop);
 //   - attenuation-only against the previous hop (FR-11);
 //   - the hop has not expired at now.
 func Verify(c Chain, keys KeyRegistry, rootPrincipalID string, now time.Time) (Grant, string, error) {
@@ -35,7 +37,7 @@ func Verify(c Chain, keys KeyRegistry, rootPrincipalID string, now time.Time) (G
 		if !ok {
 			return Grant{}, "", fmt.Errorf("delegation: no registered key for delegator %q", hop.Delegator)
 		}
-		if !ed25519.Verify(pub, canonical(hop.Delegator, hop.Delegate, hop.Grant, prevSig), hop.Signature) {
+		if !sigctx.Verify(sigctx.DelegationHop, pub, canonical(hop.Delegator, hop.Delegate, hop.Grant, prevSig), hop.Signature) {
 			return Grant{}, "", fmt.Errorf("delegation: invalid signature at hop %d", i)
 		}
 

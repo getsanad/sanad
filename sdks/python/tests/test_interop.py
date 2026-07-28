@@ -2,6 +2,9 @@
 
 These vectors are fixed by the Go code (workload/, delegation/, cmd/passport/).
 The instance key seed is the 32 bytes 0x01..0x20.
+
+The same values are pinned Go-side in workload/interop_test.go, which is what CI runs;
+changing one without the other is a wire break. Update all three suites together.
 """
 
 import base64
@@ -9,6 +12,7 @@ import json
 import unittest
 
 from sanad import (
+    CTX_INSTANCE_PROOF,
     HEADER_CREDENTIAL,
     HEADER_DELEGATION,
     HEADER_PROOF,
@@ -18,6 +22,7 @@ from sanad import (
     generate_instance_key,
     proof,
     public_key_of,
+    sigctx_message,
 )
 from sanad import _b64url_decode, _b64url_encode  # internal helpers under test
 
@@ -35,7 +40,13 @@ NONCE_B64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 EXPECTED_EVIDENCE = "umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o"
 
 PRINCIPAL_TOKEN = "test-principal-token"
-EXPECTED_PROOF = "vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ"
+# The proof is over the domain-separated signing input, not the bare token.
+EXPECTED_PROOF = "_xyI6J0jruF9VJx5RZimoWtBtrH_7lFTueCgCdeSllnwDcTP5bxCQ9ponOj9OZSbidfO-89TiuC8QYwKBYmlDw"
+# That signing input, as hex: 8-byte big-endian length || context label || token.
+EXPECTED_PROOF_INPUT = (
+    "000000000000001773616e61642f696e7374616e63652d70726f6f662f76"
+    "31746573742d7072696e636970616c2d746f6b656e"
+)
 
 CREDENTIAL_TEXT = (
     '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",'
@@ -74,10 +85,35 @@ class TestVectors(unittest.TestCase):
         print("priv64 base64url =", got)
         self.assertEqual(got, PRIV64_B64)
 
+    def test_sigctx_message_layout(self):
+        self.assertEqual(sigctx_message("abc", b"xy"), b"\x00" * 7 + b"\x03" + b"abcxy")
+        # The length prefix is what disambiguates the split between label and message.
+        self.assertNotEqual(sigctx_message("ab", b"c"), sigctx_message("a", b"bc"))
+
+    def test_proof_signing_input_vector(self):
+        got = sigctx_message(CTX_INSTANCE_PROOF, PRINCIPAL_TOKEN.encode("utf-8"))
+        print("proof signing input =", got.hex())
+        self.assertEqual(got.hex(), EXPECTED_PROOF_INPUT)
+
     def test_proof_vector(self):
         got = proof(SEED_B64, PRINCIPAL_TOKEN)
         print("proof =", got)
         self.assertEqual(got, EXPECTED_PROOF)
+
+    def test_proof_is_domain_separated_not_over_the_bare_token(self):
+        from sanad import _b64url_encode, _load_private
+
+        priv = _load_private(SEED_B64)
+        # The pre-domain-separation form: a raw signature over the token bytes. It must NOT
+        # be what the SDK sends — that signature would equally be a delegation hop signed by
+        # the same instance key, so the gateway rejects it.
+        bare = _b64url_encode(priv.sign(PRINCIPAL_TOKEN.encode("utf-8")))
+        self.assertNotEqual(proof(SEED_B64, PRINCIPAL_TOKEN), bare)
+
+        tagged = _b64url_encode(
+            priv.sign(sigctx_message(CTX_INSTANCE_PROOF, PRINCIPAL_TOKEN.encode("utf-8")))
+        )
+        self.assertEqual(proof(SEED_B64, PRINCIPAL_TOKEN), tagged)
 
     def test_proof_same_for_seed_and_priv64(self):
         self.assertEqual(

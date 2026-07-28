@@ -12,13 +12,36 @@ import (
 	"github.com/getsanad/sanad/internal/sigctx"
 )
 
+// Quote freshness. The enrollment nonce (Authority.Nonce) is the primary replay bound — a
+// quote answers one unpredictable challenge, exactly once, inside NonceTTL. These bound the
+// quote's age on the attestor's OWN terms, without reference to any authority state: Attest
+// is handed a nonce by whatever calls it and cannot see that it was single-use, unguessable
+// or short-lived, so this is the part of the freshness argument that does not rest on the
+// caller getting the challenge right.
+const (
+	// DefaultQuoteMaxAge is how old a quote may be when the caller configures no bound. It is
+	// the nonce lifetime because that is the whole window an honest quote can live in: the
+	// quote covers a challenge that did not exist before this enrollment began, and the
+	// challenge is refused after NonceTTL, so a quote older than that cannot belong to a live
+	// enrollment.
+	DefaultQuoteMaxAge = NonceTTL
+
+	// MaxQuoteSkew is how far ahead of the verifier's clock a quote's IssuedAt may sit. It
+	// exists only for an attesting platform whose clock runs fast — an NTP-synced host is
+	// within milliseconds, a freshly booted TEE that has not stepped its clock is the real
+	// case. It is kept far below the max age for the reason internal/pop keeps DefaultSkew far
+	// below DefaultMaxAge: every second of future tolerance is a second added to the life of
+	// the quote, where max-age tolerance only buys an honest client latency.
+	MaxQuoteSkew = 5 * time.Second
+)
+
 // MeasuredAttestor is a RATS-style attestor for the high-assurance tier (PRD FR-26, P3-01).
 // It verifies a quote — signed by a trusted attestation key (a TEE/TPM platform identity) —
 // asserting that the agent runs an approved build (measurement), that it is answering this
 // enrollment's challenge, and that the key being enrolled is the one it speaks for. It
 // rejects quotes signed by an untrusted key, carrying an unrecognized measurement, that are
-// stale, or that name a different nonce or key. A real deployment sources the quote from
-// hardware; here the quote is an Ed25519-signed assertion.
+// stale or dated in the future, or that name a different nonce or key. A real deployment
+// sources the quote from hardware; here the quote is an Ed25519-signed assertion.
 type MeasuredAttestor struct {
 	attKey   ed25519.PublicKey
 	approved map[string]struct{}
@@ -75,13 +98,33 @@ func (c Confirm) PublicKey() (ed25519.PublicKey, error) {
 }
 
 // NewMeasuredAttestor trusts attKey and the given approved measurements. maxAge bounds how
-// stale a quote may be (0 = no freshness check).
+// stale a quote may be; a non-positive value selects DefaultQuoteMaxAge rather than switching
+// the check off, the way internal/pop's window options keep their defaults. Turning freshness
+// off is not a configuration an operator should reach by passing a zero: the nonce carries the
+// replay defence, but a zero here silently removes the one bound the attestor holds by itself,
+// and nothing in the config or the logs would say so.
+//
+// At least one approved measurement is required, and none of them may be empty. An empty set
+// is not "approve anything", it is an attestor that can approve nothing — it fails closed, but
+// it fails closed at every enrollment for a reason no operator would guess from their config,
+// so it is refused here, where the mistake is. An empty measurement string is worse than
+// useless: it approves the one quote an attacker can produce without knowing any build hash,
+// and it is exactly what a trailing separator in a config list parses to.
 func NewMeasuredAttestor(attKey ed25519.PublicKey, approvedMeasurements []string, maxAge time.Duration) (*MeasuredAttestor, error) {
 	if len(attKey) != ed25519.PublicKeySize {
 		return nil, errors.New("workload: invalid attestation key")
 	}
+	if len(approvedMeasurements) == 0 {
+		return nil, errors.New("workload: no approved build measurements (an empty appraisal policy can never approve anything)")
+	}
+	if maxAge <= 0 {
+		maxAge = DefaultQuoteMaxAge
+	}
 	approved := make(map[string]struct{}, len(approvedMeasurements))
 	for _, m := range approvedMeasurements {
+		if m == "" {
+			return nil, errors.New("workload: empty approved build measurement")
+		}
 		approved[m] = struct{}{}
 	}
 	return &MeasuredAttestor{attKey: attKey, approved: approved, maxAge: maxAge, now: time.Now}, nil
@@ -129,7 +172,15 @@ func (m *MeasuredAttestor) Attest(evidence, nonce []byte, pubKey ed25519.PublicK
 	if _, ok := m.approved[q.Measurement]; !ok {
 		return "", fmt.Errorf("workload: unrecognized build measurement %q", q.Measurement)
 	}
-	if m.maxAge > 0 && m.now().UTC().Sub(q.IssuedAt) > m.maxAge {
+	// Freshness, bounded on both sides of now. Sub is negative for a future IssuedAt, so a
+	// max-age check alone passes for every future date: a quote dated next century would never
+	// go stale, and the attestor's own bound would be no bound at all.
+	now := m.now().UTC()
+	if q.IssuedAt.After(now.Add(MaxQuoteSkew)) {
+		return "", fmt.Errorf("workload: attestation quote is dated %s in the future (skew allowance %s)",
+			q.IssuedAt.Sub(now).Round(time.Second), MaxQuoteSkew)
+	}
+	if now.Sub(q.IssuedAt) > m.maxAge {
 		return "", errors.New("workload: stale attestation quote")
 	}
 	// The quote names the agent, and the attestation key is trusted to say so — but not to

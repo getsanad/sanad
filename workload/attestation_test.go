@@ -69,6 +69,96 @@ func TestMeasuredAttestorRejectsStale(t *testing.T) {
 	}
 }
 
+// TestMeasuredAttestorRejectsFutureDated is the regression: time.Sub is negative for a future
+// IssuedAt, so a one-sided max-age check accepted a quote dated arbitrarily far ahead — and
+// accepted it forever, since it only got further from going stale.
+func TestMeasuredAttestorRejectsFutureDated(t *testing.T) {
+	attPub, attPriv := attKeys(t)
+	att, _ := NewMeasuredAttestor(attPub, []string{"build-v1"}, time.Minute)
+	base := time.Now().UTC()
+	att.now = func() time.Time { return base }
+	instPub, _ := attKeys(t)
+
+	for _, ahead := range []time.Duration{MaxQuoteSkew + time.Second, time.Hour, 100 * 365 * 24 * time.Hour} {
+		nonce := challenge(t)
+		evidence, _ := SignQuote(attPriv, "agent-1", "build-v1", nonce, instPub, base.Add(ahead))
+		if _, err := att.Attest(evidence, nonce, instPub); err == nil {
+			t.Fatalf("a quote dated %s in the future must be rejected", ahead)
+		}
+	}
+}
+
+// TestMeasuredAttestorAllowsClockSkew pins the other edge: the allowance is for an attesting
+// platform whose clock runs fast, so a quote inside MaxQuoteSkew still attests.
+func TestMeasuredAttestorAllowsClockSkew(t *testing.T) {
+	attPub, attPriv := attKeys(t)
+	att, _ := NewMeasuredAttestor(attPub, []string{"build-v1"}, time.Minute)
+	base := time.Now().UTC()
+	att.now = func() time.Time { return base }
+	instPub, _ := attKeys(t)
+	nonce := challenge(t)
+	evidence, _ := SignQuote(attPriv, "agent-1", "build-v1", nonce, instPub, base.Add(MaxQuoteSkew-time.Second))
+
+	id, err := att.Attest(evidence, nonce, instPub)
+	if err != nil {
+		t.Fatalf("a quote inside the skew allowance must attest: %v", err)
+	}
+	if id != "agent-1" {
+		t.Fatalf("attested id = %q", id)
+	}
+}
+
+// TestMeasuredAttestorZeroMaxAgeDefaults pins that a non-positive maxAge selects
+// DefaultQuoteMaxAge rather than disabling the check: an attestor built with 0 still ages
+// quotes out on both sides.
+func TestMeasuredAttestorZeroMaxAgeDefaults(t *testing.T) {
+	attPub, attPriv := attKeys(t)
+	att, err := NewMeasuredAttestor(attPub, []string{"build-v1"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if att.maxAge != DefaultQuoteMaxAge {
+		t.Fatalf("maxAge = %s, want the default %s", att.maxAge, DefaultQuoteMaxAge)
+	}
+	base := time.Now().UTC()
+	att.now = func() time.Time { return base }
+	instPub, _ := attKeys(t)
+
+	fresh := challenge(t)
+	ok, _ := SignQuote(attPriv, "agent-1", "build-v1", fresh, instPub, base)
+	if _, err := att.Attest(ok, fresh, instPub); err != nil {
+		t.Fatalf("a fresh quote must still attest: %v", err)
+	}
+	stale := challenge(t)
+	old, _ := SignQuote(attPriv, "agent-1", "build-v1", stale, instPub, base.Add(-DefaultQuoteMaxAge-time.Second))
+	if _, err := att.Attest(old, stale, instPub); err == nil {
+		t.Fatal("maxAge 0 must select the default window, not disable the freshness check")
+	}
+	future := challenge(t)
+	ahead, _ := SignQuote(attPriv, "agent-1", "build-v1", future, instPub, base.Add(time.Hour))
+	if _, err := att.Attest(ahead, future, instPub); err == nil {
+		t.Fatal("maxAge 0 must not disable the future-date check either")
+	}
+}
+
+// TestNewMeasuredAttestorRequiresMeasurements: an empty appraisal policy fails closed, but it
+// fails closed at every enrollment for a reason the operator's config does not show. Refuse it
+// where the mistake is.
+func TestNewMeasuredAttestorRequiresMeasurements(t *testing.T) {
+	attPub, _ := attKeys(t)
+	if _, err := NewMeasuredAttestor(attPub, nil, time.Hour); err == nil {
+		t.Fatal("an attestor with no approved measurements must be refused at construction")
+	}
+	if _, err := NewMeasuredAttestor(attPub, []string{}, time.Hour); err == nil {
+		t.Fatal("an attestor with an empty measurement list must be refused at construction")
+	}
+	// "" is what a trailing separator in a config list parses to, and it would approve a quote
+	// carrying no measurement at all.
+	if _, err := NewMeasuredAttestor(attPub, []string{"build-v1", ""}, time.Hour); err == nil {
+		t.Fatal("an empty approved measurement must be refused at construction")
+	}
+}
+
 func TestMeasuredAttestorRejectsUntrustedKey(t *testing.T) {
 	attPub, _ := attKeys(t)
 	_, attackerPriv := attKeys(t)

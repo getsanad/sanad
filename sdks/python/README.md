@@ -23,6 +23,8 @@ pip install .
 ## Quickstart
 
 ```python
+import os
+
 from sanad import generate_instance_key, enroll, PassportClient
 
 # 1) Generate an Ed25519 instance key.
@@ -31,9 +33,11 @@ from sanad import generate_instance_key, enroll, PassportClient
 key = generate_instance_key()
 
 # 2) Enroll: present the bootstrap token + public key, get a workload credential.
+#    Bootstrap tokens are single-use and expiring — call this ONCE, at startup, and read
+#    the token from a file or the environment (never a command-line argument).
 result = enroll(
     "https://authority.example.com",
-    bootstrap_token="my-bootstrap-token",
+    bootstrap_token=os.environ["PASSPORT_BOOTSTRAP_TOKEN"],
     public_key=key["public_key"],
 )
 print(result["agent_id"], result["not_after"])
@@ -140,6 +144,11 @@ the SDK encodes the **exact bytes** returned by enrollment.
   process, and the result only enrolls *that* key against *that* nonce.
 - `request_nonce(authority_url) -> bytes` — the single-use enrollment challenge.
 - `enroll(authority_url, bootstrap_token, public_key) -> dict` — `{"credential": <raw text>, "agent_id", "not_after"}`.
+  A bootstrap token authorizes a bounded number of enrollments (one, by default) inside a
+  bounded window, so **enroll once per token, at startup**, and persist the credential.
+  `EnrollmentError` with status 403 and `bootstrap token … is spent` / `… expired` is
+  permanent — get a fresh token rather than retrying. Status 429 is not: the authority
+  rate-limits both enrollment legs together and sends `Retry-After`; back off for that long.
 - `class PassportClient(gateway_url, instance_key, credential, delegation=None, principal_key=None)`
   - `.headers(server_id, path, principal_token, method="GET", body=None) -> dict` — the
     headers for **that request**; the proof is bound to its method, target and body.

@@ -1,17 +1,29 @@
 // Package workload issues short-lived, per-instance workload credentials via attestation
 // (PRD FR-1, FR-4, SEC-1). An agent instance generates an ephemeral key pair at startup
 // and proves itself to the Authority, which returns a signed credential binding the agent
-// id to that public key for a short time. There is no long-lived shared secret.
+// id to that public key for a short time.
 //
 // Enrolling takes two steps: the instance fetches a single-use nonce from the Authority,
 // then presents attestation evidence covering both that nonce and the public key it is
 // enrolling. Evidence that does not cover the key would let anyone who captured one
 // attestation mint a credential for that agent id bound to their own key.
 //
+// # What is secret here
+//
+// Nothing an instance holds afterwards is long-lived: the instance key is generated at
+// startup and the credential expires within the hour. The one standing secret in the package
+// is the bootstrap token TokenAttestor accepts, and it is a bootstrap credential rather than a
+// standing one — it authorizes a bounded number of enrollments (one by default) inside a
+// bounded window, it is spent as it is used, and it never crosses the wire, because the
+// evidence is an HMAC keyed by it. The high-assurance tier has no shared secret at all:
+// MeasuredAttestor takes a platform-signed quote (P3-01). TokenAttestor is the dev/self-host
+// path and is deliberately the weakest thing in the package.
+//
+// The spent-token and outstanding-nonce tables are both PROCESS-LOCAL — see Authority.
+//
 // Instance mTLS (P2-02) will present this credential at the gateway; the KeyStore feeds
 // verified agent keys into delegation verification (P2-04), which is what makes multi-hop
-// delegation work end-to-end. Hardware-backed attestation is the high-assurance tier (P3-01);
-// here the Attestor is pluggable and TokenAttestor is a development implementation.
+// delegation work end-to-end.
 package workload
 
 import (
@@ -89,34 +101,104 @@ func ValidAgentID(id string) error {
 // implementation that ignores either lets a quote captured from the network, a log or a CI
 // artifact be replayed to mint a credential for that agent id bound to an attacker's key.
 // Real implementations validate node/TEE/TPM attestation (P3-01).
+//
+// Authority.Issue calls Attest exactly once per enrollment attempt, after it has already
+// spent the nonce, so an implementation backed by a one-time credential may spend it here.
 type Attestor interface {
 	Attest(evidence, nonce []byte, pubKey ed25519.PublicKey) (agentID string, err error)
+}
+
+// Bootstrap-token budget. A bootstrap token is a secret an operator writes into a config and
+// an agent reads at startup, and what used to make it worth stealing was that it was good
+// forever and good for any number of instances: one leaked token enrolled unlimited instances
+// under that agent id until someone noticed. A token now buys a bounded number of enrollments
+// inside a bounded window and is spent as it is used, so a leaked one is worth at most the
+// enrollments its owner has not made yet, and nothing at all once the window closes.
+const (
+	// DefaultTokenUses is how many enrollments one bootstrap token authorizes when the operator
+	// does not say otherwise. One: an instance enrolls once, at startup, and every use after
+	// that is either an operator who meant to ask for it or somebody else.
+	DefaultTokenUses = 1
+
+	// DefaultTokenTTL is how long a bootstrap token stays usable after it is registered. It is
+	// sized for "start the authority, then start the agent", not for "keep this in the CI
+	// config" — a token that outlives the deployment that used it is a standing credential
+	// again, which is the thing being removed.
+	DefaultTokenTTL = 15 * time.Minute
+)
+
+// TokenGrant is what one bootstrap token buys: the agent id it enrolls, how many enrollments
+// it authorizes, and for how long. Both bounds run from the moment the token is registered —
+// for cmd/authority that is process start, because the tokens come from the environment.
+// A non-positive Uses or TTL selects the default rather than meaning "unlimited"; unlimited is
+// not a budget an operator should be able to reach by leaving a field zero.
+type TokenGrant struct {
+	AgentID string
+	Uses    int
+	TTL     time.Duration
+}
+
+// grant is a registered token's remaining budget.
+type grant struct {
+	agentID  string
+	left     int
+	uses     int // as registered, for the error message when left hits zero
+	notAfter time.Time
 }
 
 // TokenAttestor maps pre-registered bootstrap tokens to agent ids — a simple dev/self-host
 // attestor. Its evidence is an HMAC keyed by the bootstrap token over the enrollment nonce
 // and the instance key (see BootstrapEvidence), so the token never crosses the wire and a
-// captured blob is worthless with any other key or nonce. It is concurrency-safe.
+// captured blob is worthless with any other key or nonce. Each token carries a budget
+// (TokenGrant) that Attest spends. It is concurrency-safe.
+//
+// The spent-use counters are PROCESS-LOCAL, like the Authority's nonce table: a second
+// authority replica has its own counters, so N replicas honour a single-use token N times,
+// and restarting the process re-registers every token from the environment with a full budget
+// and a fresh window. Both are acceptable for the dev/self-host path this attestor is for and
+// neither is acceptable at scale, which is why a real deployment runs MeasuredAttestor or
+// SPIFFE instead — those spend nothing, so there is no consumed state to share.
 type TokenAttestor struct {
-	mu     sync.RWMutex
-	tokens map[string]string // bootstrap token -> agentID
+	mu     sync.Mutex
+	tokens map[string]*grant
+	now    func() time.Time
 }
 
 // NewTokenAttestor returns an empty TokenAttestor.
 func NewTokenAttestor() *TokenAttestor {
-	return &TokenAttestor{tokens: map[string]string{}}
+	return &TokenAttestor{tokens: map[string]*grant{}, now: time.Now}
 }
 
-// Register binds a bootstrap token to an agent id. It rejects an id that is not a valid agent
-// name (ValidAgentID) — notably one shaped like a principal's DID — so a mistyped or hostile
-// entry fails where it is configured rather than at some later enrollment.
+// Register binds a bootstrap token to an agent id with the default budget — one enrollment,
+// within DefaultTokenTTL. RegisterGrant sets a different one.
 func (a *TokenAttestor) Register(token, agentID string) error {
-	if err := ValidAgentID(agentID); err != nil {
+	return a.RegisterGrant(token, TokenGrant{AgentID: agentID})
+}
+
+// RegisterGrant binds a bootstrap token to an agent id for g.Uses enrollments over g.TTL.
+// Re-registering a token replaces its grant and resets its budget, which is how an operator
+// refreshes one.
+//
+// It rejects an id that is not a valid agent name (ValidAgentID) — notably one shaped like a
+// principal's DID — so a mistyped or hostile entry fails where it is configured rather than at
+// some later enrollment. It rejects an empty token for the same reason: an entry that no
+// evidence can ever match is a config line the operator believes is doing something.
+func (a *TokenAttestor) RegisterGrant(token string, g TokenGrant) error {
+	if token == "" {
+		return errors.New("workload: empty bootstrap token")
+	}
+	if err := ValidAgentID(g.AgentID); err != nil {
 		return err
+	}
+	if g.Uses <= 0 {
+		g.Uses = DefaultTokenUses
+	}
+	if g.TTL <= 0 {
+		g.TTL = DefaultTokenTTL
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.tokens[token] = agentID
+	a.tokens[token] = &grant{agentID: g.AgentID, left: g.Uses, uses: g.Uses, notAfter: a.now().UTC().Add(g.TTL)}
 	return nil
 }
 
@@ -130,9 +212,10 @@ func (a *TokenAttestor) Register(token, agentID string) error {
 // label sits in its own quoted field and cannot absorb bytes from nonce or pub. Keeping it as
 // it is also keeps the SDK enrollment vectors stable.
 //
-// The token is still a shared secret whose holder can enroll at will — making bootstrap
-// tokens single-use and expiring is a separate item; this only stops a captured enrollment
-// from being replayed with someone else's key.
+// The token is still a shared secret: whoever holds it can enroll as that agent, up to the
+// budget the operator registered and inside its window (TokenGrant). What this construction
+// adds is that holding a captured *enrollment* is not holding the token — the MAC only
+// enrolls that one key against that one nonce.
 func BootstrapEvidence(token string, nonce []byte, pub ed25519.PublicKey) []byte {
 	msg, _ := json.Marshal(struct {
 		Ctx   string `json:"ctx"`
@@ -144,20 +227,54 @@ func BootstrapEvidence(token string, nonce []byte, pub ed25519.PublicKey) []byte
 	return m.Sum(nil)
 }
 
-// Attest implements Attestor. It trials each registered token: the token is not on the wire
-// to look up, and a dev/self-host attestor holds a handful of them.
+// Attest implements Attestor, spending one use of the matching token. It trials each
+// registered token: the token is not on the wire to look up, and a dev/self-host attestor
+// holds a handful of them.
+//
+// A token that matches but is out of budget or past its window is refused with a message
+// naming which of the two it was. Saying so costs nothing: the caller got there by producing a
+// valid MAC, so it already holds the token, and the alternative — a bare "attestation
+// rejected" — is the operator-facing half of the failure this whole change is about. A dev
+// stack whose enrollments stop working for a reason nobody can read is a dev stack where
+// somebody widens the budget until it goes away.
+//
+// A spent grant is kept rather than deleted, so the message stays available on every later
+// attempt. Deleting it would not remove the secret from the process anyway: the token came
+// from the environment and is still there.
 func (a *TokenAttestor) Attest(evidence, nonce []byte, pubKey ed25519.PublicKey) (string, error) {
 	if len(pubKey) != ed25519.PublicKeySize || len(nonce) == 0 {
 		return "", errors.New("workload: attestation rejected")
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	for token, id := range a.tokens {
-		if id != "" && hmac.Equal(evidence, BootstrapEvidence(token, nonce, pubKey)) {
-			return id, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for token, g := range a.tokens {
+		if g.agentID == "" || !hmac.Equal(evidence, BootstrapEvidence(token, nonce, pubKey)) {
+			continue
 		}
+		if !a.now().UTC().Before(g.notAfter) {
+			return "", fmt.Errorf("workload: bootstrap token for %q expired at %s; register a fresh one",
+				g.agentID, g.notAfter.Format(time.RFC3339))
+		}
+		if g.left <= 0 {
+			return "", fmt.Errorf("workload: bootstrap token for %q is spent (it authorized %d enrollment(s)); register a fresh one",
+				g.agentID, g.uses)
+		}
+		g.left--
+		return g.agentID, nil
 	}
 	return "", errors.New("workload: attestation rejected")
+}
+
+// Remaining reports how many enrollments a registered token still authorizes, for tests,
+// startup logging and metrics. An unknown, expired or fully spent token is 0.
+func (a *TokenAttestor) Remaining(token string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	g, ok := a.tokens[token]
+	if !ok || !a.now().UTC().Before(g.notAfter) {
+		return 0
+	}
+	return g.left
 }
 
 // Credential is a short-lived, CA-signed assertion binding an agent id to a public key.
@@ -182,11 +299,16 @@ type Authority struct {
 	// Outstanding enrollment nonces (nonce -> expiry). This state is PROCESS-LOCAL: a nonce
 	// minted by one authority replica is unknown to every other, so enrollment across
 	// replicas only works if the two requests land on the same process. A single authority
-	// process is the supported deployment for now; sharing this table (with the KeyStore) is
-	// a Phase 3 durability item.
+	// process is the supported deployment for now; sharing this table (with the KeyStore, the
+	// limiter below and TokenAttestor's spent-use counters) is a Phase 3 durability item.
 	nonceMu  sync.Mutex
 	nonces   map[string]time.Time
 	nonceTTL time.Duration
+
+	// limiter bounds both enrollment endpoints together. It lives on the Authority rather than
+	// being middleware a deployment wraps on, so that mounting the handlers is enough to get it
+	// and there is no way to mount the nonce leg unlimited.
+	limiter *Limiter
 }
 
 // NewAuthority returns an Authority that signs with caPriv (key id kid) and attests via att.
@@ -203,8 +325,17 @@ func NewAuthority(caPriv ed25519.PrivateKey, kid string, att Attestor, ttl time.
 	return &Authority{
 		caPriv: caPriv, kid: kid, att: att, ttl: ttl, now: time.Now,
 		nonces: map[string]time.Time{}, nonceTTL: NonceTTL,
+		limiter: NewLimiter(DefaultEnrollLimit()),
 	}, nil
 }
+
+// SetEnrollLimit replaces the budget the enrollment endpoints are rate limited to, for a
+// deployment whose honest agents legitimately enroll faster than DefaultEnrollLimit (a fleet
+// rolling several hundred instances at once). It resets the buckets and is safe to call while
+// the handlers are serving. There is no way to switch limiting off: the endpoints are
+// unauthenticated, and an operator who needs more headroom wants a bigger number, not no
+// number.
+func (a *Authority) SetEnrollLimit(l EnrollLimit) { a.limiter.SetLimit(l) }
 
 // CAPublicKey returns the key used to verify issued credentials.
 func (a *Authority) CAPublicKey() ed25519.PublicKey {

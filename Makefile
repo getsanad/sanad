@@ -40,8 +40,11 @@ run-admin:
 	go run ./cmd/admin
 
 # Run the credential authority locally. Prints the CA pubkey to set as PASSPORT_WORKLOAD_CA.
+# Bootstrap tokens default to ONE enrollment over 15m; the dev budget below is widened so a
+# local loop can re-enroll. Restart this process to reissue it.
 run-authority:
-	PASSPORT_BOOTSTRAP_TOKENS=boot=agent-1 go run ./cmd/authority
+	PASSPORT_BOOTSTRAP_TOKENS=boot=agent-1 PASSPORT_BOOTSTRAP_USES=25 PASSPORT_BOOTSTRAP_TTL=24h \
+		go run ./cmd/authority
 
 # Generate throwaway dev secrets/identities for the docker-compose stack (writes deploy/.env
 # and deploy/secrets/). DEV ONLY.

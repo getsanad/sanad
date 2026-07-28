@@ -20,6 +20,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -58,9 +59,17 @@ Usage:
       Generate an Ed25519 instance key. Give its public key to your operator to
       obtain a workload credential.
 
-  passport enroll --authority URL --token TOK [--key agent.key --out cred.json]
+  passport enroll --authority URL [--token-file FILE | --token-env VAR]
+                  [--key agent.key --out cred.json]
       Generate (or reuse) an instance key, present the bootstrap token to the
-      authority, and save the issued workload credential.
+      authority, and save the issued workload credential. Bootstrap tokens are
+      single-use and expiring: enroll once per token, at startup.
+
+      --token-file FILE   file holding the bootstrap token ("-" reads stdin)
+      --token-env VAR     env var holding it instead (default PASSPORT_BOOTSTRAP_TOKEN)
+
+      There is no --token flag: an argument is visible to every process on the
+      host (ps, /proc/<pid>/cmdline) and is written to your shell history.
 
   passport proxy --gateway URL --key FILE --credential FILE [options]
       Run a local sidecar. Point your agent's MCP client at it; it injects the
@@ -100,14 +109,33 @@ func keygen(args []string) {
 func enroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	authority := fs.String("authority", "", "authority base URL (required)")
-	token := fs.String("token", "", "bootstrap attestation token (required)")
+	tokenFile := fs.String("token-file", "", "file holding the bootstrap token (\"-\" reads stdin)")
+	tokenEnv := fs.String("token-env", "PASSPORT_BOOTSTRAP_TOKEN", "env var holding the bootstrap token")
+	// Defined only so removing it says why. A flag that vanishes into "flag provided but not
+	// defined" reads as a version skew, and the natural fix is to find an older binary.
+	legacy := fs.String("token", "", "removed: pass the bootstrap token by file or environment")
 	keyFile := fs.String("key", "agent.key", "instance private key file (generated if missing)")
 	out := fs.String("out", "cred.json", "file to write the issued workload credential to")
 	_ = fs.Parse(args)
 
-	if *authority == "" || *token == "" {
-		fmt.Fprintln(os.Stderr, "enroll: --authority and --token are required")
+	if *legacy != "" {
+		fmt.Fprintln(os.Stderr, `enroll: --token has been removed. A command line is world-readable
+(ps, /proc/<pid>/cmdline) and lands in your shell history, so a bootstrap token passed that
+way leaks to every other process on the host and outlives the command.
+
+Use one of:
+  passport enroll --authority URL --token-file bootstrap.token
+  cat bootstrap.token | passport enroll --authority URL --token-file -
+  PASSPORT_BOOTSTRAP_TOKEN=... passport enroll --authority URL`)
 		os.Exit(2)
+	}
+	if *authority == "" {
+		fmt.Fprintln(os.Stderr, "enroll: --authority is required")
+		os.Exit(2)
+	}
+	token, err := readSecret(*tokenFile, *tokenEnv)
+	if err != nil {
+		log.Fatalf("enroll: bootstrap token: %v", err)
 	}
 
 	_, pub, err := loadOrGenKey(*keyFile)
@@ -118,7 +146,7 @@ func enroll(args []string) {
 	// nonce and this public key, so it enrolls this key once and nothing else.
 	cred, err := workload.Enroll(context.Background(), nil, *authority, pub,
 		func(nonce []byte, pub ed25519.PublicKey) ([]byte, error) {
-			return workload.BootstrapEvidence(*token, nonce, pub), nil
+			return workload.BootstrapEvidence(token, nonce, pub), nil
 		})
 	if err != nil {
 		log.Fatalf("enroll: %v", err)
@@ -166,6 +194,10 @@ func runProxy(args []string) {
 
 	if *gatewayURL == "" || *keyFile == "" || *credFile == "" {
 		fmt.Fprintln(os.Stderr, "proxy: --gateway, --key and --credential are required")
+		os.Exit(2)
+	}
+	if *tokenFile == "-" {
+		fmt.Fprintln(os.Stderr, "proxy: --token-file - is not supported; the sidecar re-reads the token on every request (so rotating the file works) and stdin cannot be read twice")
 		os.Exit(2)
 	}
 
@@ -338,19 +370,47 @@ func loadChainHeader(path string) (string, error) {
 	return delegation.EncodeChain(c)
 }
 
-func tokenSource(file, env string) func() (string, error) {
-	return func() (string, error) {
-		if file != "" {
-			b, err := os.ReadFile(file)
-			if err != nil {
-				return "", err
-			}
-			return strings.TrimSpace(string(b)), nil
+// readSecret reads a token from a file — "-" being stdin — or, when no file is given, from an
+// environment variable. Neither path is the command line, and that is the point: argv is
+// readable by every process on the host (`ps`, /proc/<pid>/cmdline on Linux, which is
+// world-readable) and the shell writes it to history, so a secret passed as an argument
+// outlives the command and leaks sideways to any user on the box.
+//
+// A file is the better of the two: /proc/<pid>/environ is mode 0400 and readable only by the
+// process owner and root, but the environment is inherited by every child the agent spawns,
+// survives into core dumps and crash reports, and is what container platforms print back in a
+// task description. A file can be mode 0600, mounted as a secret, replaced to rotate, and read
+// once. The env var stays supported because it is what a container platform hands you and it
+// is still strictly better than argv.
+func readSecret(file, env string) (string, error) {
+	switch {
+	case file == "-":
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<10))
+		if err != nil {
+			return "", fmt.Errorf("reading stdin: %w", err)
 		}
-		t := os.Getenv(env)
-		if t == "" {
-			return "", fmt.Errorf("no principal token in $%s", env)
+		return trimmedOrError(string(b), "stdin was empty")
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", err
 		}
+		return trimmedOrError(string(b), fmt.Sprintf("%s is empty", file))
+	default:
+		return trimmedOrError(os.Getenv(env), fmt.Sprintf("no token in $%s (or pass --token-file)", env))
+	}
+}
+
+func trimmedOrError(s, msg string) (string, error) {
+	if t := strings.TrimSpace(s); t != "" {
 		return t, nil
 	}
+	return "", errors.New(msg)
+}
+
+// tokenSource resolves the principal token per request rather than once at startup, so a
+// rotated token file is picked up without restarting the sidecar. That is also why runProxy
+// refuses "-" here: stdin cannot be read twice.
+func tokenSource(file, env string) func() (string, error) {
+	return func() (string, error) { return readSecret(file, env) }
 }

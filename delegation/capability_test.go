@@ -43,7 +43,7 @@ func TestCapabilityOfflineAttenuation(t *testing.T) {
 	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read", "write"}, Servers: []string{"s1", "s2"}})
 
 	// A holder narrows it OFFLINE (no issuer contact, only s0).
-	narrowed, _, err := cap.Attenuate(s0, Grant{Tools: []string{"read"}, Servers: []string{"s1"}})
+	narrowed, _, err := cap.Attenuate(rootPub, s0, Grant{Tools: []string{"read"}, Servers: []string{"s1"}})
 	if err != nil {
 		t.Fatalf("attenuate: %v", err)
 	}
@@ -57,9 +57,9 @@ func TestCapabilityOfflineAttenuation(t *testing.T) {
 }
 
 func TestCapabilityWideningRejected(t *testing.T) {
-	_, rootPriv := rootKeys(t)
+	rootPub, rootPriv := rootKeys(t)
 	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
-	if _, _, err := cap.Attenuate(s0, Grant{Tools: []string{"read", "write"}}); err == nil {
+	if _, _, err := cap.Attenuate(rootPub, s0, Grant{Tools: []string{"read", "write"}}); err == nil {
 		t.Fatal("widening on Attenuate must be rejected")
 	}
 }
@@ -74,10 +74,10 @@ func TestCapabilityWrongRootRejected(t *testing.T) {
 }
 
 func TestCapabilityWrongHolderSecretRejected(t *testing.T) {
-	_, rootPriv := rootKeys(t)
+	rootPub, rootPriv := rootKeys(t)
 	cap, _, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
 	_, attacker := rootKeys(t)
-	if _, _, err := cap.Attenuate(attacker, Grant{Tools: []string{"read"}}); err == nil {
+	if _, _, err := cap.Attenuate(rootPub, attacker, Grant{Tools: []string{"read"}}); err == nil {
 		t.Fatal("attenuating with a non-holder secret must be rejected")
 	}
 }
@@ -93,7 +93,7 @@ func TestCapabilityExpired(t *testing.T) {
 func TestCapabilityHolderProof(t *testing.T) {
 	rootPub, rootPriv := rootKeys(t)
 	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
-	narrowed, s1, _ := cap.Attenuate(s0, Grant{Tools: []string{"read"}})
+	narrowed, s1, _ := cap.Attenuate(rootPub, s0, Grant{Tools: []string{"read"}})
 	if _, err := narrowed.Verify(rootPub, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestCapabilityHolderProof(t *testing.T) {
 func TestCapabilityRecipientCannotBroaden(t *testing.T) {
 	rootPub, rootPriv := rootKeys(t)
 	broad, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read", "write"}})
-	narrowed, s1, _ := broad.Attenuate(s0, Grant{Tools: []string{"read"}})
+	narrowed, s1, _ := broad.Attenuate(rootPub, s0, Grant{Tools: []string{"read"}})
 
 	// The recipient holds `narrowed` + s1 only (not s0). They try to present the broader
 	// parent token. It is well-formed (verifies), but they cannot prove they hold it.
@@ -261,7 +261,7 @@ func TestCapabilityStageEmptyServersIsAnyServer(t *testing.T) {
 func TestCapabilityEncodeDecode(t *testing.T) {
 	rootPub, rootPriv := rootKeys(t)
 	cap, s0, _ := NewCapability(rootPriv, Grant{Tools: []string{"read", "write"}})
-	cap, _, _ = cap.Attenuate(s0, Grant{Tools: []string{"read"}})
+	cap, _, _ = cap.Attenuate(rootPub, s0, Grant{Tools: []string{"read"}})
 
 	enc, err := EncodeCapability(cap)
 	if err != nil {

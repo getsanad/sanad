@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -88,6 +89,9 @@ func NewRoot(principalKey ed25519.PrivateKey, principalID, delegateID string, g 
 	if len(principalKey) != ed25519.PrivateKeySize {
 		return Chain{}, errors.New("delegation: invalid principal key")
 	}
+	if principalID == delegateID {
+		return Chain{}, fmt.Errorf("%w: %q cannot delegate to itself", ErrCycle, principalID)
+	}
 	sig := sigctx.Sign(sigctx.DelegationHop, principalKey, canonical(principalID, delegateID, g, nil))
 	return Chain{Hops: []Hop{{Delegator: principalID, Delegate: delegateID, Grant: g, Signature: sig}}}, nil
 }
@@ -95,12 +99,27 @@ func NewRoot(principalKey ed25519.PrivateKey, principalID, delegateID string, g 
 // Extend appends a hop: the current holder (the last hop's delegate) delegates onward to
 // delegateID under grant g, signing with the holder's key. Attenuation is enforced at
 // Verify time; callers should pass a grant that narrows the one they hold.
+//
+// The depth ceiling and the no-repeated-party rule are enforced HERE too, not only at Verify
+// time: a chain that cannot be verified is not worth minting, and failing at the hop that
+// broke the rule names the hop, where failing at verification names only the chain.
 func (c Chain) Extend(holderKey ed25519.PrivateKey, delegateID string, g Grant) (Chain, error) {
 	if len(c.Hops) == 0 {
 		return Chain{}, errors.New("delegation: cannot extend an empty chain")
 	}
 	if len(holderKey) != ed25519.PrivateKeySize {
 		return Chain{}, errors.New("delegation: invalid holder key")
+	}
+	if len(c.Hops)+1 > MaxDepth {
+		return Chain{}, fmt.Errorf("%w: extending would make %d hops, the maximum is %d", ErrTooDeep, len(c.Hops)+1, MaxDepth)
+	}
+	if delegateID == c.Hops[0].Delegator {
+		return Chain{}, fmt.Errorf("%w: %q is the chain's root delegator", ErrCycle, delegateID)
+	}
+	for i, h := range c.Hops {
+		if h.Delegate == delegateID {
+			return Chain{}, fmt.Errorf("%w: %q already holds this delegation from hop %d", ErrCycle, delegateID, i)
+		}
 	}
 	last := c.Hops[len(c.Hops)-1]
 	sig := sigctx.Sign(sigctx.DelegationHop, holderKey, canonical(last.Delegate, delegateID, g, last.Signature))

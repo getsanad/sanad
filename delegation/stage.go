@@ -21,7 +21,8 @@ type StageOption func(*stageOptions)
 
 type stageOptions struct {
 	requireChain bool
-	proof        []pop.Option // holder-proof freshness window / replay cache (CapabilityStage)
+	proof        []pop.Option   // holder-proof freshness window / replay cache (CapabilityStage)
+	verify       []VerifyOption // depth ceiling, forwarded to Verify / Capability.Verify
 }
 
 // WithRequireChain makes the stage fail closed when the request carries no delegation,
@@ -48,6 +49,13 @@ func WithHolderProofCacheEntries(n int) StageOption {
 // WithHolderProofClock replaces the holder-proof verifier's clock, for tests.
 func WithHolderProofClock(now func() time.Time) StageOption {
 	return func(o *stageOptions) { o.proof = append(o.proof, pop.WithClock(now)) }
+}
+
+// WithVerifyOptions forwards verification options — today WithMaxDepth — to the Verify or
+// Capability.Verify call the stage makes. A deployment whose delegation topology is flatter
+// than MaxDepth should tighten it here; nothing can loosen it past the ceiling.
+func WithVerifyOptions(v ...VerifyOption) StageOption {
+	return func(o *stageOptions) { o.verify = append(o.verify, v...) }
 }
 
 func newStageOptions(opts []StageOption) stageOptions {
@@ -82,7 +90,7 @@ func Stage(keys KeyRegistry, extract ChainExtractor, opts ...StageOption) gatewa
 			}
 			return nil
 		}
-		grant, actingAgent, err := Verify(chain, keys, req.Principal.ID, time.Now())
+		grant, actingAgent, err := Verify(chain, keys, req.Principal.ID, time.Now(), o.verify...)
 		if err != nil {
 			return err // fail closed
 		}

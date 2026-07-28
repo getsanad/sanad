@@ -25,13 +25,34 @@ import (
 // verifies against a SINGLE root public key and can be narrowed by its holder OFFLINE,
 // with no issuer contact, so it works across trust boundaries.
 //
-// Each block carries the public key authorized to sign the next block, and is itself
-// signed by the previous block's next-key (the root key signs block 0). Thus only the root
-// key is a trust anchor; every later key is authenticated by the chain. To *use* a
-// capability the presenter must also prove possession of the final next-key (HolderProof),
-// which is what prevents a recipient from broadening it: they lack the earlier next-secrets.
+// Each block carries the public key authorized to sign the next block, and is itself signed
+// by the previous block's next-key (the root key signs block 0), over its own index and the
+// previous block's signature — so a block is fixed to one position in one capability under
+// one root, exactly as Chain's prevSig fixes a hop. To *use* a capability the presenter must
+// additionally prove possession of the final next-key on the request (HolderProof).
+//
+// # Why there is a Seal
+//
+// Block signatures chain forwards, and a forward chain cannot see its own tail being cut
+// off: every PREFIX of a valid capability is itself a valid capability, and the shortest
+// prefix carries the broadest grant. So a recipient handed a token narrowed to ["read"]
+// could drop the last block and present the parent's ["read","write"] — well-formed, fully
+// verifying, and broader than anything they were given. Chaining the previous signature into
+// each block (as Chain does with prevSig) does not close that, because the prefix is not
+// altered by the truncation; nothing in a block can commit to a block that did not exist
+// when it was signed. The commitment has to come from the END. The Seal is it: a signature
+// by the final next-key over how many blocks there are, which only the current holder can
+// produce and which no prefix satisfies. It is the same move audit/merkle.go makes for the
+// same reason — a hash chain detects rewriting but not tail-truncation, so the length is
+// committed to separately.
+//
+// The Seal is NOT a substitute for VerifyHolder and not a proof of entitlement: it travels
+// with the token, so anyone who copies the token copies the seal. It answers "is this the
+// whole capability", where HolderProof answers "is the presenter its holder, on THIS
+// request". Verify needs the first to be safe on its own; a decision needs both.
 type Capability struct {
 	Blocks []Block `json:"blocks"`
+	Seal   []byte  `json:"seal"`
 }
 
 // Block is one segment of a Capability.
@@ -47,20 +68,30 @@ func NewCapability(rootPriv ed25519.PrivateKey, g Grant) (Capability, ed25519.Pr
 	if len(rootPriv) != ed25519.PrivateKeySize {
 		return Capability{}, nil, errors.New("delegation: invalid root key")
 	}
+	rootPub := rootPriv.Public().(ed25519.PublicKey)
 	nextPub, nextPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return Capability{}, nil, err
 	}
-	sig := sigctx.Sign(sigctx.CapabilityBlock, rootPriv, blockMsg(g, nextPub))
-	return Capability{Blocks: []Block{{Grant: g, NextPub: nextPub, Signature: sig}}}, nextPriv, nil
+	sig := sigctx.Sign(sigctx.CapabilityBlock, rootPriv, blockMsg(rootPub, 0, nil, g, nextPub))
+	blocks := []Block{{Grant: g, NextPub: nextPub, Signature: sig}}
+	return Capability{Blocks: blocks, Seal: seal(nextPriv, rootPub, blocks)}, nextPriv, nil
 }
 
 // Attenuate appends a narrowed block signed with the current holder secret, returning the
 // new token and the new holder secret. Narrowing is enforced locally (and re-checked by
 // Verify). It runs entirely offline.
-func (c Capability) Attenuate(holderSecret ed25519.PrivateKey, g Grant) (Capability, ed25519.PrivateKey, error) {
+//
+// It re-seals: the seal commits to the block count, so the old one is void the moment a
+// block is appended. rootPub has to be passed in because a capability does not carry its own
+// trust anchor — it is the one thing the verifier supplies — and every block signature, seal
+// included, is bound to it.
+func (c Capability) Attenuate(rootPub ed25519.PublicKey, holderSecret ed25519.PrivateKey, g Grant) (Capability, ed25519.PrivateKey, error) {
 	if len(c.Blocks) == 0 {
 		return Capability{}, nil, errors.New("delegation: empty capability")
+	}
+	if len(c.Blocks)+1 > MaxDepth {
+		return Capability{}, nil, fmt.Errorf("%w: attenuating would make %d blocks, the maximum is %d", ErrTooDeep, len(c.Blocks)+1, MaxDepth)
 	}
 	last := c.Blocks[len(c.Blocks)-1]
 	if !holderSecret.Public().(ed25519.PublicKey).Equal(last.NextPub) {
@@ -73,26 +104,35 @@ func (c Capability) Attenuate(holderSecret ed25519.PrivateKey, g Grant) (Capabil
 	if err != nil {
 		return Capability{}, nil, err
 	}
-	sig := sigctx.Sign(sigctx.CapabilityBlock, holderSecret, blockMsg(g, nextPub))
+	sig := sigctx.Sign(sigctx.CapabilityBlock, holderSecret, blockMsg(rootPub, len(c.Blocks), last.Signature, g, nextPub))
 	blocks := append(append([]Block(nil), c.Blocks...), Block{Grant: g, NextPub: nextPub, Signature: sig})
-	return Capability{Blocks: blocks}, nextPriv, nil
+	return Capability{Blocks: blocks, Seal: seal(nextPriv, rootPub, blocks)}, nextPriv, nil
 }
 
 // Verify checks the capability against the root public key (the only trust anchor) and
-// returns the effective (most-narrowed) grant. It is fully offline. NOTE: for an access
-// decision, pair this with VerifyHolder — Verify alone proves the token is well-formed and
-// attenuating, not that the presenter is entitled to wield it.
-func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time) (Grant, error) {
+// returns the effective (most-narrowed) grant. It is fully offline.
+//
+// The depth ceiling is checked FIRST, before any signature: a capability is presented in a
+// header by an unauthenticated caller, so the block count is attacker-chosen and must not be
+// allowed to choose how much work this does (see MaxDepth).
+//
+// NOTE: for an access decision, pair this with VerifyHolder — Verify proves the token is
+// whole, well-formed and attenuating, not that the PRESENTER is entitled to wield it.
+func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time, opts ...VerifyOption) (Grant, error) {
 	if len(c.Blocks) == 0 {
 		return Grant{}, errors.New("delegation: empty capability")
 	}
+	if limit := newVerifyOptions(opts).maxDepth; len(c.Blocks) > limit {
+		return Grant{}, fmt.Errorf("%w: capability has %d blocks, the maximum is %d", ErrTooDeep, len(c.Blocks), limit)
+	}
 	signer := rootPub
+	var prevSig []byte
 	var prevGrant Grant
 	for i, b := range c.Blocks {
 		if len(b.NextPub) != ed25519.PublicKeySize {
 			return Grant{}, fmt.Errorf("delegation: block %d has an invalid next key", i)
 		}
-		if !sigctx.Verify(sigctx.CapabilityBlock, signer, blockMsg(b.Grant, b.NextPub), b.Signature) {
+		if !sigctx.Verify(sigctx.CapabilityBlock, signer, blockMsg(rootPub, i, prevSig, b.Grant, b.NextPub), b.Signature) {
 			return Grant{}, fmt.Errorf("delegation: capability block %d has an invalid signature", i)
 		}
 		if i > 0 {
@@ -104,7 +144,15 @@ func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time) (Grant, err
 			return Grant{}, fmt.Errorf("delegation: capability block %d has expired", i)
 		}
 		signer = b.NextPub
+		prevSig = b.Signature
 		prevGrant = b.Grant
+	}
+	// Last, because the key it verifies against is the final next-key, and that key is only
+	// authenticated by the loop above. This is the check that makes a truncated capability
+	// fail: a prefix's seal would have to be made by an earlier next-secret, which is held by
+	// the party who attenuated, not by the recipient who was handed the narrowed token.
+	if !sigctx.Verify(sigctx.CapabilitySeal, signer, sealMsg(rootPub, len(c.Blocks), prevSig), c.Seal) {
+		return Grant{}, errors.New("delegation: capability seal is missing or invalid (a truncated capability cannot be re-sealed)")
 	}
 	return c.Blocks[len(c.Blocks)-1].Grant, nil
 }
@@ -175,7 +223,8 @@ func EncodeCapability(c Capability) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// DecodeCapability parses a capability from its transport form.
+// DecodeCapability parses a capability from its transport form. Like DecodeChain it refuses
+// an over-long token at the transport boundary, before it reaches any verification.
 func DecodeCapability(s string) (Capability, error) {
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -184,6 +233,9 @@ func DecodeCapability(s string) (Capability, error) {
 	var c Capability
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Capability{}, fmt.Errorf("delegation: bad capability: %w", err)
+	}
+	if len(c.Blocks) > MaxDepth {
+		return Capability{}, fmt.Errorf("%w: capability has %d blocks, the maximum is %d", ErrTooDeep, len(c.Blocks), MaxDepth)
 	}
 	return c, nil
 }
@@ -219,7 +271,7 @@ func CapabilityStage(rootPub ed25519.PublicKey, opts ...StageOption) gateway.Sta
 		if err != nil {
 			return err
 		}
-		grant, err := c.Verify(rootPub, time.Now())
+		grant, err := c.Verify(rootPub, time.Now(), o.verify...)
 		if err != nil {
 			return err
 		}
@@ -255,8 +307,45 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
-func blockMsg(g Grant, nextPub ed25519.PublicKey) []byte {
-	return append(grantCanonical(g), nextPub...)
+// blockMsg is the signing input for one block. It commits to everything that fixes the
+// block's PLACE as well as its content: the root key the capability hangs from, the block's
+// index, and the previous block's signature (nil for block 0, where the signer is the root
+// key itself). That is the same chaining Chain.canonical gets from prevSig, and it is what
+// makes a block un-reorderable and un-graftable: a block signed as "block 2 of the
+// capability whose block 1 signature was S, anchored at root R" verifies nowhere else.
+//
+// It is JSON rather than a concatenation because the parts are variable-length: prevSig ||
+// nextPub and a longer prevSig with a shorter nextPub would otherwise be the same bytes.
+// (The v1 encoding was grantCanonical(g) || nextPub, which was unambiguous only because
+// nextPub had a fixed size — a property that does not survive adding a field.)
+func blockMsg(rootPub ed25519.PublicKey, index int, prevSig []byte, g Grant, nextPub ed25519.PublicKey) []byte {
+	b, _ := json.Marshal(struct {
+		Root  []byte          `json:"root"`
+		Index int             `json:"i"`
+		Prev  []byte          `json:"prev,omitempty"`
+		Grant json.RawMessage `json:"grant"`
+		Next  []byte          `json:"next"`
+	}{rootPub, index, prevSig, grantCanonical(g), nextPub})
+	return b
+}
+
+// seal signs the capability's length with the final next-secret. See Capability's doc
+// comment for why the length needs its own commitment.
+func seal(nextPriv ed25519.PrivateKey, rootPub ed25519.PublicKey, blocks []Block) []byte {
+	return sigctx.Sign(sigctx.CapabilitySeal, nextPriv, sealMsg(rootPub, len(blocks), blocks[len(blocks)-1].Signature))
+}
+
+// sealMsg is the signing input for the seal: the trust anchor, the number of blocks, and the
+// last block's signature. The last signature already commits to every block before it
+// (blockMsg chains them), so those two values pin the capability exactly — a prefix has a
+// different count AND a different final signature.
+func sealMsg(rootPub ed25519.PublicKey, blocks int, lastSig []byte) []byte {
+	b, _ := json.Marshal(struct {
+		Root   []byte `json:"root"`
+		Blocks int    `json:"n"`
+		Last   []byte `json:"last"`
+	}{rootPub, blocks, lastSig})
+	return b
 }
 
 func grantCanonical(g Grant) []byte {

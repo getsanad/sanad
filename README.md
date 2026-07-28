@@ -37,6 +37,7 @@ prints the tamper-evident audit log and an investigation. No external setup need
 | `workload/` | Per-instance workload credentials + attestation (incl. measured/TEE) |
 | `delegation/` | Delegation: signed chains, centralized exchange, offline capability |
 | `policy/` | Authorization hook (deny-by-default allowlist + human-in-the-loop) |
+| `config/` | The configuration document (`PASSPORT_POLICY_FILE`) and its validation |
 | `revoke/` | Kill-switch / revocation |
 | `sts/` | Security token service: mints passports |
 | `verify/` | Offline passport verification library + MCP server adapter |
@@ -75,6 +76,9 @@ agents ──HTTP──▶  gateway (this server)  ──▶  your protected MCP
 make run
 #   PASSPORT_GATEWAY_ADDR        listen address (default :8080)
 #   PASSPORT_SERVERS             "id=https://upstream,..." protected MCP servers
+#   PASSPORT_POLICY_FILE         authorization rules (see below); unset = deny everything
+#   PASSPORT_APPROVAL_TIMEOUT    how long a held action waits for a human (default 2m)
+#   PASSPORT_ADMIN_TOKEN         bearer token for the review API at /admin/reviews
 #   PASSPORT_PRINCIPAL_MODE      "oidc" (default) or "vc"
 #   PASSPORT_OIDC_ISSUER/_CLIENT_ID   (oidc mode)
 #   PASSPORT_VC_TRUSTED_ISSUERS  comma-separated trusted issuer DIDs (vc mode)
@@ -94,6 +98,57 @@ make run-authority
 For real deployment: `go build ./cmd/gateway` produces a single static binary — run it on
 a VM/container/Kubernetes next to your MCP servers (it's self-hostable for data residency;
 see ADR-004/NFR-6). Put it on the network path so agents target the gateway URL.
+
+## Authorizing actions (policy file)
+
+The gateway denies everything until you tell it otherwise. `PASSPORT_POLICY_FILE` points at a
+JSON document (see [`config/`](config/config.go) for why JSON and not YAML) that says, per
+protected server, which JSON-RPC **methods** and which **tools** an agent may use — and which
+need a human first:
+
+```json
+{
+  "version": 1,
+  "policy": {
+    "servers": {
+      "github": {
+        "note": "read-only research bot; issue creation needs a human",
+        "allow":  {"methods": ["initialize", "notifications/initialized", "tools/list", "(none)"],
+                   "tools":   ["search_issues", "get_file"]},
+        "review": {"tools": ["create_issue"]}
+      }
+    }
+  }
+}
+```
+
+- **`tools`** match the tool a `tools/call` names (`params.name`). **`methods`** match every
+  other JSON-RPC message — the MCP handshake, `tools/list`, notifications — plus `"(none)"` for
+  a request carrying no JSON-RPC call at all (the `GET` that opens the event stream). Splitting
+  them is what lets you allow *listing* the tools while gating *running* one.
+- `"*"` is the wildcard for one list on one server; an exact entry always beats it, and a
+  `review` entry beats an `allow` entry.
+- Anything not listed is denied. Anything under `review` is held until an operator answers.
+- `note` is where comments go, since JSON has none. Unknown keys are a **startup error**, so a
+  typo can never quietly become a missing rule; so is a malformed file, a duplicate entry, or an
+  entry listed as both allowed and reviewed.
+- `PASSPORT_ALLOW_ALL=1` (dev) refuses to start alongside a policy file, rather than silently
+  overriding it.
+
+**Human-in-the-loop.** A `review` action blocks the caller's request while an operator decides.
+Set `PASSPORT_ADMIN_TOKEN` to expose the review API on the gateway (without it the endpoints are
+absent and every held action times out and is denied):
+
+```sh
+curl -H "Authorization: Bearer $PASSPORT_ADMIN_TOKEN" localhost:8080/admin/reviews
+# [{"id":"qFsLUZ…","server":"github","method":"tools/call","tool":"create_issue","principal":"…"}]
+curl -H "Authorization: Bearer $PASSPORT_ADMIN_TOKEN" -X POST \
+  localhost:8080/admin/reviews/approve -d '{"id":"qFsLUZ…"}'      # …or /deny with a "reason"
+```
+
+The pending queue lives **in the gateway process that took the request** — it is a blocked
+request, not a database row — so with multiple replicas an operator must reach the replica
+holding it, and an id is unknown anywhere else. A shared, durable approval queue is Phase 3.
 
 ## The full stack locally (Docker)
 

@@ -72,25 +72,38 @@ func TestStageNoPrincipalFailsClosed(t *testing.T) {
 	}
 }
 
-func TestStageNilToolExtractorWildcardAllows(t *testing.T) {
-	// A nil extractor yields an empty tool; only a "*" allowlist should permit it, and the
-	// granted scope must stay empty (no concrete tool to record).
-	stage := Stage(NewAllowList().Allow("server-a", "*"), nil, nil)
+func TestStageNilExtractorDecidedAsMethodNone(t *testing.T) {
+	// A nil extractor yields no tool, so the decision is made in the METHOD namespace, under
+	// MethodNone. A method entry for it permits the request; the granted scope stays empty
+	// (there is no concrete tool to record).
+	stage := Stage(NewAllowList().AllowMethods("server-a", MethodNone), nil, nil)
 	req := authedReq("server-a")
 	if err := stage.Handle(context.Background(), req); err != nil {
-		t.Fatalf("nil extractor + wildcard should allow: %v", err)
+		t.Fatalf("nil extractor + a MethodNone entry should allow: %v", err)
 	}
 	if len(req.Scope.Tools) != 0 {
 		t.Fatalf("empty tool must not be recorded in scope, got %v", req.Scope.Tools)
 	}
+
+	// A method wildcard covers it too, and so does nothing else.
+	if err := Stage(NewAllowList().AllowMethods("server-a", Wildcard), nil, nil).Handle(context.Background(), authedReq("server-a")); err != nil {
+		t.Fatalf("nil extractor + method wildcard should allow: %v", err)
+	}
 }
 
-func TestStageNilToolExtractorNonWildcardDenies(t *testing.T) {
-	// Empty tool against a specific (non-"*") allowlist is denied.
-	stage := Stage(NewAllowList().Allow("server-a", "read"), nil, nil)
-	req := authedReq("server-a")
-	if err := stage.Handle(context.Background(), req); err == nil {
-		t.Fatal("empty tool against a non-wildcard allowlist must deny")
+func TestStageNilExtractorToolRulesDoNotApply(t *testing.T) {
+	// The namespaces are separate on purpose: a request that invokes no tool is not authorized
+	// by tool entries — not by a named one, and not by the tool wildcard either, which would
+	// otherwise be the only way to permit a tools/call and would drag every non-MCP request
+	// through with it.
+	for _, al := range []*AllowList{
+		NewAllowList().Allow("server-a", "read"),
+		NewAllowList().Allow("server-a", Wildcard),
+	} {
+		req := authedReq("server-a")
+		if err := Stage(al, nil, nil).Handle(context.Background(), req); err == nil {
+			t.Fatal("a request naming no tool must not be authorized by tool entries")
+		}
 	}
 }
 

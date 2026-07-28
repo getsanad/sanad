@@ -97,7 +97,57 @@ func NewHandler(svc *Service, token string) http.Handler {
 		})
 	}
 
+	// Human-approval queue (FR-16), available only when one is wired in — and only meaningful
+	// in a process that actually holds pending reviews (see Reviews).
+	if svc.HasReviews() {
+		registerReviews(mux, svc.reviews)
+	}
+
 	return withAuth(token, mux)
+}
+
+// ReviewHandler serves ONLY the human-approval endpoints, for the process that holds the
+// queue: the gateway. It is separate from NewHandler because the gateway has no business
+// exposing the rest of the control plane (principals, agents, the kill-switch) on its data
+// plane, and because the queue is per-process — a review can only be answered where it is
+// parked (see Reviews).
+//
+// token is required by the caller (cmd/gateway refuses to mount this without one): these
+// endpoints release actions a policy deliberately held for a human, so an unauthenticated one
+// would let the caller whose request is pending approve it themselves.
+func ReviewHandler(r Reviews, token string) http.Handler {
+	mux := http.NewServeMux()
+	registerReviews(mux, r)
+	return withAuth(token, mux)
+}
+
+// registerReviews mounts the review endpoints on mux:
+//
+//	GET  /admin/reviews          list what is waiting for a decision
+//	POST /admin/reviews/approve  {"id": "…"}                  release the held request
+//	POST /admin/reviews/deny     {"id": "…", "reason": "…"}   fail it closed
+//
+// Resolving is a POST with the id in the body rather than in the path, to match the shape the
+// rest of this API already uses (/admin/revoke, /admin/restore). An id that is no longer
+// pending is a 404, never a 200: "approved" must mean the request was actually released.
+func registerReviews(mux *http.ServeMux, reviews Reviews) {
+	mux.HandleFunc("GET /admin/reviews", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, pendingReviews(reviews))
+	})
+	mux.HandleFunc("POST /admin/reviews/approve", func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ ID string }
+		if !decode(w, r, &in) {
+			return
+		}
+		respond(w, http.StatusOK, approveReview(reviews, in.ID), map[string]string{"approved": in.ID})
+	})
+	mux.HandleFunc("POST /admin/reviews/deny", func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ ID, Reason string }
+		if !decode(w, r, &in) {
+			return
+		}
+		respond(w, http.StatusOK, denyReview(reviews, in.ID, in.Reason), map[string]string{"denied": in.ID})
+	})
 }
 
 func withAuth(token string, h http.Handler) http.Handler {
@@ -132,7 +182,9 @@ func respond(w http.ResponseWriter, code int, err error, v any) {
 // revoked" walks away believing the agent is cut off — and it is not a 400 either, so it
 // becomes 503 with an explicit account of which ids did and did not take effect. The cause
 // itself stays in the server log; it can carry a DSN, host, or driver detail that must not
-// leave the process. Everything else is a validation error the caller can act on and keeps
+// leave the process. A reference to something that does not exist is a 404, separated from the
+// 400s because "your request was malformed" and "that review is no longer pending" call for
+// different next moves. Everything else is a validation error the caller can act on and keeps
 // its message, which this package writes itself.
 func writeError(w http.ResponseWriter, err error) {
 	var se *StoreError
@@ -144,6 +196,11 @@ func writeError(w http.ResponseWriter, err error) {
 			"applied": se.Applied,
 			"failed":  se.Failed(),
 		})
+		return
+	}
+	var nf *NotFoundError
+	if errors.As(err, &nf) {
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	http.Error(w, err.Error(), http.StatusBadRequest)

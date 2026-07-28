@@ -98,6 +98,9 @@ Gateway (full list in `cmd/gateway/main.go`):
 | Var | Purpose |
 |---|---|
 | `PASSPORT_SERVERS` | `id=url,id2=url2` protected MCP servers |
+| `PASSPORT_POLICY_FILE` | path to the authorization document: per server, which JSON-RPC methods and tools are allowed and which need a human (see the README). Unset = deny everything. A file that does not parse, or whose rules do not validate, is a **fatal startup error** naming the offending entry — never a partial load |
+| `PASSPORT_APPROVAL_TIMEOUT` | how long an action held for human approval waits before it is denied (default `2m`; `0` = until the caller disconnects) |
+| `PASSPORT_ADMIN_TOKEN` | bearer token for the review API (`/admin/reviews`) on the gateway. **Unset = the review API is not mounted**, and anything routed to review times out and denies |
 | `PASSPORT_PRINCIPAL_MODE` | `oidc` (default) or `vc` |
 | `PASSPORT_SIGNING_KEY` | base64url 32-byte seed (stable across replicas) |
 | `PASSPORT_WORKLOAD_CA` | base64url Ed25519 CA pubkey; enables instance auth + delegation |
@@ -129,3 +132,23 @@ did and did not take effect — `{"error": ..., "op": "revoke", "applied": [], "
 failure leaves nothing half-applied; retry it. The underlying cause goes to the admin log
 only, so it never leaks the DSN to the caller. **Treat a 5xx here as "the agent is still
 live"** and escalate.
+
+## Human-in-the-loop approvals across replicas
+
+An action a policy marks `review` blocks the caller's HTTP request until an operator resolves
+it over `/admin/reviews` on the gateway. **That queue is per-process and in-memory** — a pending
+review is a blocked request inside one replica, not a row in a database — with two consequences
+for a multi-replica deployment:
+
+- Only the replica holding the request can resolve it. Any other replica answers `404`
+  ("already resolved, expired, or held by another gateway replica"). Reach the replicas
+  individually (a headless service / per-pod address), or run approvals against a
+  single-replica deployment, until the durable queue lands (Phase 3).
+- A replica restart or rollout drops every review it was holding. That fails in the safe
+  direction — the held requests fail closed rather than being let through — but the operator's
+  console will simply stop showing them.
+
+`PASSPORT_APPROVAL_TIMEOUT` bounds how long each held request occupies a connection. Reviews are
+resolved by exactly one winner: an operator told "approved" has approved the decision the
+requester actually received, and an approval that arrives after the timeout answers `404`
+rather than reporting a success nobody acted on.

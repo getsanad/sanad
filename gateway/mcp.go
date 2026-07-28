@@ -59,10 +59,10 @@ type rpcMessage struct {
 // A body we cannot read as JSON-RPC — arbitrary JSON, a form post, a binary upload, garbage —
 // yields NO calls rather than an error. The gateway fronts whatever a registered upstream
 // speaks and must not turn every non-MCP POST into a 400. "No calls" is also not "allow": it
-// lands on exactly the path a bodyless request already takes, where the PDP decides with an
-// empty tool — a denial under the shipped deny-by-default, and under a "*" allowlist the
-// operator's own explicit choice. An unparseable body cannot invent a tool name, so admitting
-// one bypasses nothing.
+// lands on exactly the path a bodyless request already takes, where the PDP gets one decision
+// naming no tool and no method (policy.MethodNone) — a denial under the shipped
+// deny-by-default, and an allow only where the operator's policy says so in as many words. An
+// unparseable body cannot invent a tool name, so admitting one bypasses nothing.
 //
 // A message that positively identifies itself as a tools/call but does not name a tool IS an
 // error. That is the one shape where failing open would matter: a request whose entire purpose

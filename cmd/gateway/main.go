@@ -6,6 +6,14 @@
 //
 //	PASSPORT_GATEWAY_ADDR        listen address (default :8080)
 //	PASSPORT_SERVERS             "id=upstreamURL,id2=url2" protected MCP servers
+//	PASSPORT_POLICY_FILE         path to the authorization config (see the config package);
+//	                             unset = deny everything
+//	PASSPORT_ALLOW_ALL           1 = permit every action (development only; refuses to start
+//	                             alongside PASSPORT_POLICY_FILE)
+//	PASSPORT_APPROVAL_TIMEOUT    how long an action held for human approval waits before it is
+//	                             denied (default 2m; 0 = wait for the client to give up)
+//	PASSPORT_ADMIN_TOKEN         bearer token for the review API at /admin/reviews; without it
+//	                             the review API is NOT mounted
 //	PASSPORT_PRINCIPAL_MODE      "oidc" (default) or "vc"
 //	PASSPORT_OIDC_ISSUER         IdP issuer URL (oidc mode)
 //	PASSPORT_OIDC_CLIENT_ID      expected audience / client id (oidc mode)
@@ -42,7 +50,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/getsanad/sanad/admin"
 	"github.com/getsanad/sanad/audit"
+	"github.com/getsanad/sanad/config"
 	"github.com/getsanad/sanad/delegation"
 	"github.com/getsanad/sanad/gateway"
 	"github.com/getsanad/sanad/jwks"
@@ -74,7 +84,7 @@ func main() {
 		log.Fatalf("gateway: signer: %v", err)
 	}
 
-	pipeline, killSwitch, err := buildPipeline(context.Background(), signer)
+	pipeline, killSwitch, approver, err := buildPipeline(context.Background(), signer, reg)
 	if err != nil {
 		log.Fatalf("gateway: pipeline: %v", err)
 	}
@@ -112,6 +122,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg2.Handler())
 	mux.Handle("/.well-known/jwks.json", jwks.Handler(jwks.Key{Kid: signer.KeyID(), Pub: signer.Public()}))
+	mountReviewAPI(mux, approver)
 	mux.Handle("/", metrics.Middleware(reg2, g))
 
 	addr := envOr("PASSPORT_GATEWAY_ADDR", ":8080")
@@ -119,6 +130,32 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("gateway: %v", err)
 	}
+}
+
+// mountReviewAPI exposes the human-approval queue (FR-16) so an operator can see and resolve
+// the actions a policy held for review. It is mounted on the gateway's own listener because
+// that is where the queue lives: a pending review is a request parked in THIS process, and no
+// other process — not even the admin service — can release it.
+//
+// It is mounted ONLY with a bearer token. These endpoints release actions a policy
+// deliberately refused to let through unsupervised, so an open one would let the very caller
+// whose request is pending approve it. Without a token the endpoints are absent and reviews
+// simply time out and deny, which is the fail-closed direction.
+func mountReviewAPI(mux *http.ServeMux, approver *policy.ManualApprover) {
+	if approver == nil {
+		return
+	}
+	token := os.Getenv("PASSPORT_ADMIN_TOKEN")
+	if token == "" {
+		log.Print("WARNING: PASSPORT_ADMIN_TOKEN unset: the review API (/admin/reviews) is NOT mounted; " +
+			"any action a policy routes to human approval will wait for its timeout and then be DENIED")
+		return
+	}
+	h := admin.ReviewHandler(approver, token)
+	mux.Handle("/admin/reviews", h)
+	mux.Handle("/admin/reviews/", h)
+	log.Print("review API at /admin/reviews (Authorization: Bearer $PASSPORT_ADMIN_TOKEN); " +
+		"keep it off the public path in front of this gateway")
 }
 
 // registerServers parses "id=upstreamURL,id2=url2" into the registry.
@@ -145,15 +182,18 @@ func registerServers(reg *gateway.Registry, spec string) error {
 }
 
 // buildPipeline assembles the decision pipeline from configuration. It also returns the
-// kill-switch it wired, so main can surface its snapshot age on /readyz and /metrics.
-func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *revoke.CachedStore, error) {
+// kill-switch it wired, so main can surface its snapshot age on /readyz and /metrics, and the
+// approver holding actions routed to human review, so main can mount the API that resolves
+// them. reg is read-only here: the policy file is cross-checked against it, so a server id
+// typo'd in one and not the other is reported rather than silently denying everything.
+func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry) (gateway.Pipeline, *revoke.CachedStore, *policy.ManualApprover, error) {
 	// One kill-switch enforced at both authentication and mint time (P1-07). Reads are
 	// served from a local snapshot (hot path never makes a DB call, FR-20); when a shared
 	// Postgres source is configured the snapshot refreshes so revocations propagate across
 	// replicas (NFR-2).
 	ks, err := buildKillSwitch()
 	if err != nil {
-		return gateway.Pipeline{}, nil, err
+		return gateway.Pipeline{}, nil, nil, err
 	}
 
 	// Optional workload identity. Its key store also lets the VC principal authenticator
@@ -163,7 +203,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 	if caB64 := os.Getenv("PASSPORT_WORKLOAD_CA"); caB64 != "" {
 		pub, derr := base64.RawURLEncoding.DecodeString(caB64)
 		if derr != nil || len(pub) != ed25519.PublicKeySize {
-			return gateway.Pipeline{}, nil, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
+			return gateway.Pipeline{}, nil, nil, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
 		}
 		caPub = ed25519.PublicKey(pub)
 		store = workload.NewKeyStore(caPub)
@@ -171,7 +211,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 
 	auth, err := buildPrincipalAuth(ctx, ks, store)
 	if err != nil {
-		return gateway.Pipeline{}, nil, err
+		return gateway.Pipeline{}, nil, nil, err
 	}
 	// Never serve unauthenticated by accident. A pipeline with no principal stage mints no
 	// passport, so the gateway denies every proxied request (gateway/proxy.go) while looking
@@ -183,11 +223,11 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 			if os.Getenv("PASSPORT_PRINCIPAL_MODE") == "vc" {
 				need = "PASSPORT_VC_TRUSTED_ISSUERS"
 			}
-			return gateway.Pipeline{}, nil, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
+			return gateway.Pipeline{}, nil, nil, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
 				envOr("PASSPORT_PRINCIPAL_MODE", "oidc"), need)
 		}
 		log.Print("WARNING: PASSPORT_DEV_NO_AUTH=1: no principal authentication configured; every proxied request will be denied (development only)")
-		return gateway.Pipeline{}, ks, nil
+		return gateway.Pipeline{}, ks, nil, nil
 	}
 
 	// Order: principal -> [instance -> delegation] -> revoke -> policy -> mint. Revoke runs
@@ -214,16 +254,23 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 		log.Print("instance auth + delegation enabled (PASSPORT_WORKLOAD_CA set)")
 	}
 
-	// Deny-by-default (FR-15). PASSPORT_ALLOW_ALL=1 permits everything for development —
-	// everything the delegation allows, that is: the policy stage intersects its decision
-	// with the verified grant, so even allow-all cannot mint past a signed chain.
-	pdp := policy.DenyAll
-	if os.Getenv("PASSPORT_ALLOW_ALL") == "1" {
-		log.Print("PASSPORT_ALLOW_ALL=1: permitting all actions (development only)")
-		pdp = policy.Func(func(context.Context, policy.Input) (types.Decision, error) {
-			return types.Decision{Effect: types.EffectAllow, Reason: "allow-all (dev)"}, nil
-		})
+	// The operator's authorization rules (FR-16), from a file rather than from Go.
+	pdp, err := buildPDP(reg)
+	if err != nil {
+		return gateway.Pipeline{}, nil, nil, err
 	}
+
+	// The human-in-the-loop approver a review is routed to. It is always wired: passing nil
+	// here — which the gateway did — turned every EffectReview into an immediate deny, so a
+	// policy could ask for approval but never get it. Without the review API mounted
+	// (PASSPORT_ADMIN_TOKEN) a review still cannot be answered, but it now fails by TIMING OUT
+	// rather than by the feature being unreachable, and the timeout is the operator's to set.
+	timeout, err := approvalTimeout()
+	if err != nil {
+		return gateway.Pipeline{}, nil, nil, err
+	}
+	approver := policy.NewManualApprover(timeout)
+
 	// Token isolation (FR-8): the mint stage forwards the minted passport plus a minimal
 	// transport allowlist, and drops everything else the caller sent. PASSPORT_FORWARD_HEADERS
 	// widens that allowlist for upstreams that legitimately need a header of their own (e.g.
@@ -235,13 +282,94 @@ func buildPipeline(ctx context.Context, signer sts.Signer) (gateway.Pipeline, *r
 	}
 	mint := sts.MintStage(sts.New(signer, sts.Config{Issuer: envOr("PASSPORT_ISSUER_NAME", "sanad")}), mopts...)
 
-	// policy.MCPTools is the real tool extractor: the gateway buffers the JSON-RPC body and
-	// parses it, so the tool a tools/call names reaches the decision (FR-16) instead of the
-	// nil extractor's empty tool. Turning it on makes attenuation live — the stage intersects
-	// the requested tool with the delegated grant and denies anything outside it — which is
-	// why it lands together with the buffering rather than before it.
-	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, policy.MCPTools, nil), mint)
-	return gateway.Pipeline{Stages: stages}, ks, nil
+	// policy.MCPActions is the real extractor: the gateway buffers the JSON-RPC body and parses
+	// it, so the method and the tool a tools/call names reach the decision (FR-16) instead of
+	// the nil extractor's empty action. Turning it on makes attenuation live — the stage
+	// intersects the requested tool with the delegated grant and denies anything outside it —
+	// which is why it lands together with the buffering rather than before it.
+	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, policy.MCPActions, approver), mint)
+	return gateway.Pipeline{Stages: stages}, ks, approver, nil
+}
+
+// buildPDP selects the policy decision point. There are three configurations and the default
+// is the safe one:
+//
+//   - PASSPORT_POLICY_FILE: the operator's allowlist, deny-by-default, per server, per tool and
+//     per JSON-RPC method. Invalid content is a startup error, never a partial load — a gateway
+//     running on half a policy is worse than one that did not start.
+//   - PASSPORT_ALLOW_ALL=1: permits everything, for development. Everything the DELEGATION
+//     allows, that is: the policy stage intersects its decision with the verified grant, so even
+//     allow-all cannot mint past a signed chain.
+//   - neither: deny everything (FR-15). A gateway with no policy authorizes nothing.
+//
+// The two are mutually exclusive rather than ordered. Whichever won, the other would be a
+// setting an operator believes is in force and is not — and with allow-all winning, a
+// carefully written policy file would be silently ignored.
+func buildPDP(reg *gateway.Registry) (policy.PDP, error) {
+	path := strings.TrimSpace(os.Getenv("PASSPORT_POLICY_FILE"))
+	allowAll := os.Getenv("PASSPORT_ALLOW_ALL") == "1"
+
+	switch {
+	case allowAll && path != "":
+		return nil, fmt.Errorf("PASSPORT_ALLOW_ALL=1 and PASSPORT_POLICY_FILE=%s are mutually exclusive: "+
+			"allow-all would override every rule in the file. Unset one of them", path)
+
+	case allowAll:
+		log.Print("PASSPORT_ALLOW_ALL=1: permitting all actions (development only)")
+		return policy.Func(func(context.Context, policy.Input) (types.Decision, error) {
+			return types.Decision{Effect: types.EffectAllow, Reason: "allow-all (dev)"}, nil
+		}), nil
+
+	case path == "":
+		log.Print("no PASSPORT_POLICY_FILE set: deny-by-default, every proxied request is denied " +
+			"(point it at a policy file to authorize anything)")
+		return policy.DenyAll, nil
+	}
+
+	file, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	cfg := file.Policy
+	for _, w := range cfg.Warnings() {
+		log.Printf("WARNING: policy: %s", w)
+	}
+	for _, id := range cfg.ServerIDs() {
+		// A policy for a server that is not registered denies nothing and allows nothing: the
+		// gateway 404s the id before the pipeline runs. It is almost always a typo in one of the
+		// two places the id appears, so say so instead of leaving the operator to wonder why
+		// their rules have no effect.
+		if _, ok := reg.Lookup(id); !ok {
+			log.Printf("WARNING: policy: server %q is not registered (PASSPORT_SERVERS); its rules have no effect", id)
+		}
+		if note := cfg.Servers[id].Note; note != "" {
+			log.Printf("policy: server %q: %s", id, note)
+		}
+	}
+	log.Printf("policy: loaded %s (%d server(s), deny-by-default)", path, len(cfg.Servers))
+	return cfg.AllowList(), nil
+}
+
+// approvalTimeout reads how long an action held for human approval waits before it is denied
+// (PASSPORT_APPROVAL_TIMEOUT). The default is two minutes: long enough for an operator who is
+// watching to answer, short enough that an agent is not left holding a connection while nobody
+// is. "0" means wait indefinitely — until the caller disconnects, which cancels the request
+// context and releases it — and is for deployments whose approvals are genuinely asynchronous.
+// A negative or unparseable value is a startup error rather than a silent fallback: an operator
+// who tried to configure the window should not discover during an incident that they did not.
+func approvalTimeout() (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv("PASSPORT_APPROVAL_TIMEOUT"))
+	if v == "" {
+		return 2 * time.Minute, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("PASSPORT_APPROVAL_TIMEOUT must be a non-negative duration (e.g. 90s, 5m, or 0 to wait indefinitely), got %q", v)
+	}
+	if d == 0 {
+		log.Print("PASSPORT_APPROVAL_TIMEOUT=0: reviews wait indefinitely; a request held for approval is released only by an operator decision or by the caller disconnecting")
+	}
+	return d, nil
 }
 
 // buildPrincipalAuth selects the principal authenticator by PASSPORT_PRINCIPAL_MODE

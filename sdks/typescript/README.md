@@ -77,12 +77,25 @@ Return the base64url 32-byte public key for an instance private key. Accepts eit
 base64url of the Ed25519 signature, made with the instance key, over the UTF-8 bytes
 of the principal token. This is the proof-of-possession sent as `X-Agent-Proof`.
 
+### `bootstrapEvidence(bootstrapToken, nonce, publicKey): Buffer`
+The attestation evidence a Go `workload.TokenAttestor` accepts: HMAC-SHA256, keyed by
+the bootstrap token, over the authority-issued nonce and the public key being enrolled
+(mirrors Go's `workload.BootstrapEvidence`). The bootstrap token never leaves the
+process, and the result only enrolls *that* key against *that* nonce — so an enrollment
+captured off the wire cannot be replayed with somebody else's key.
+
+### `requestNonce(authorityUrl, fetch?): Promise<Buffer>`
+`POST`s to `${authorityUrl}/enroll/nonce` and returns the decoded single-use challenge.
+This is the RATS freshness nonce (carried as EAT `eat_nonce`): the authority accepts it
+exactly once, within a short window.
+
 ### `enroll(opts): Promise<{ credential; agentId?; notAfter? }>`
-`opts`: `{ authorityUrl, bootstrapToken, publicKey, fetch? }`. `POST`s
-`{ evidence: base64url(utf8(bootstrapToken)), public_key }` to `${authorityUrl}/enroll`.
-On HTTP 200 returns the **raw credential JSON text** in `credential` (plus `agentId` /
-`notAfter` parsed out for convenience). Throws on any non-200, including the status and
-response body.
+`opts`: `{ authorityUrl, bootstrapToken, publicKey, fetch? }`. Two requests: fetch a
+nonce from `${authorityUrl}/enroll/nonce`, then `POST`
+`{ nonce, evidence, public_key }` to `${authorityUrl}/enroll`, where `evidence` covers
+both the nonce and the public key. On HTTP 200 returns the **raw credential JSON text**
+in `credential` (plus `agentId` / `notAfter` parsed out for convenience). Throws on any
+non-200, including the status and response body.
 
 ### `class PassportClient`
 Constructed with `{ gatewayUrl, instanceKey, credential, delegation?, fetch? }`.
@@ -107,9 +120,19 @@ Everything below matches the Go implementation exactly.
   `buf.toString('base64url')`). Decoding tolerates missing padding.
 - **Crypto**: Ed25519.
 - **Instance key**: the persisted private key is `base64url(seed(32) || publicKey(32))`.
-- **Enrollment**: `POST ${authorityUrl}/enroll`, `Content-Type: application/json`,
-  body `{"evidence": base64url(utf8(bootstrapToken)), "public_key": base64url(pub32)}`.
-  The 200 response body is the credential JSON, stored as raw text.
+- **Enrollment** is two requests, both `Content-Type: application/json`:
+  1. `POST ${authorityUrl}/enroll/nonce` with body `{}` → `{"nonce": base64url(bytes),
+     "expires_in": <seconds>}`. Single-use, short-lived.
+  2. `POST ${authorityUrl}/enroll` with body `{"nonce": base64url(nonce), "evidence":
+     base64url(evidence), "public_key": base64url(pub32)}`. The 200 response body is
+     the credential JSON, stored as raw text.
+
+  The evidence must cryptographically cover **both** the nonce and the public key, or
+  the authority refuses it — a quote captured from one enrollment cannot be re-presented
+  with a different key. For the bootstrap (dev) attestor the evidence is
+  `HMAC-SHA256(bootstrapToken, canonicalJSON({ctx, nonce, pub}))`, where `ctx` is
+  `"sanad/bootstrap-evidence/v1"` and `nonce`/`pub` are **standard, padded** base64
+  (Go's `encoding/json` rendering of `[]byte`). The bootstrap token itself is never sent.
 - **Request URL**: `${gatewayUrl}/servers/${serverId}${path}`.
 - **Credential header**: base64url of the *exact* credential bytes — never
   JSON.parse-then-stringify, which would break the credential's embedded signature.
@@ -149,3 +172,4 @@ The tests lock these fixed vectors (generated from the Go code) for the 32-byte 
 | `publicKeyOf(seed)` | `ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ` |
 | 64-byte `seed\|\|pub` form | `AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA` |
 | `proof(seed, "test-principal-token")` | `vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ` |
+| `bootstrapEvidence("boot-token", nonce, pub)` where nonce is `0x00..0x1f` | `umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o` |

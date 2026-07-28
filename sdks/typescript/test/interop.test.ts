@@ -11,6 +11,8 @@ import {
   generateInstanceKey,
   publicKeyOf,
   proof,
+  bootstrapEvidence,
+  requestNonce,
   enroll,
   PassportClient,
   HEADER_CREDENTIAL,
@@ -26,6 +28,11 @@ const FULL_B64URL =
 const EXPECTED_PUB = 'ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ';
 const EXPECTED_PROOF =
   'vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ';
+
+// Enrollment nonce 0x00..0x1f, and the bootstrap evidence Go's workload.BootstrapEvidence
+// produces for it with token "boot-token" and EXPECTED_PUB.
+const NONCE_B64URL = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
+const EXPECTED_EVIDENCE = 'umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o';
 
 const CRED_TEXT =
   '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","IssuedAt":"2026-07-10T00:00:00Z","NotAfter":"2026-07-10T01:00:00Z","KeyID":"ca-1","Signature":"AA=="}';
@@ -152,10 +159,61 @@ test('PassportClient.request injects headers, method, body and forwards to the g
   assert.equal(headers['Content-Type'], 'application/json');
 });
 
-test('enroll posts the right body and returns the raw credential + parsed fields', async () => {
+test('bootstrapEvidence matches the fixed Go vector', () => {
+  const evidence = bootstrapEvidence(
+    'boot-token',
+    Buffer.from(NONCE_B64URL, 'base64url'),
+    Buffer.from(EXPECTED_PUB, 'base64url'),
+  );
+  assert.equal(evidence.toString('base64url'), EXPECTED_EVIDENCE);
+});
+
+test('bootstrapEvidence is bound to the nonce and the key', () => {
+  const nonce = Buffer.from(NONCE_B64URL, 'base64url');
+  const pub = Buffer.from(EXPECTED_PUB, 'base64url');
+  const otherKey = Buffer.alloc(32, 9);
+  const otherNonce = Buffer.alloc(32, 9);
+
+  // Changing either input must change the evidence — otherwise a captured enrollment
+  // could be replayed with a different key, which is exactly what this prevents.
+  assert.notEqual(
+    bootstrapEvidence('boot-token', nonce, otherKey).toString('base64url'),
+    EXPECTED_EVIDENCE,
+  );
+  assert.notEqual(
+    bootstrapEvidence('boot-token', otherNonce, pub).toString('base64url'),
+    EXPECTED_EVIDENCE,
+  );
+  assert.notEqual(
+    bootstrapEvidence('other-token', nonce, pub).toString('base64url'),
+    EXPECTED_EVIDENCE,
+  );
+});
+
+test('requestNonce posts to /enroll/nonce and decodes the challenge', async () => {
   const captured: { url: string; init: RequestInit }[] = [];
   const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
     captured.push({ url: String(url), init: init ?? {} });
+    return new Response(JSON.stringify({ nonce: NONCE_B64URL, expires_in: 120 }), {
+      status: 200,
+    });
+  }) as unknown as typeof fetch;
+
+  const nonce = await requestNonce('https://authority.example.com/', fakeFetch);
+  assert.equal(nonce.toString('base64url'), NONCE_B64URL);
+  assert.equal(captured[0]!.url, 'https://authority.example.com/enroll/nonce');
+  assert.equal(captured[0]!.init.method, 'POST');
+});
+
+test('enroll fetches a nonce, posts key-bound evidence, and returns the raw credential', async () => {
+  const captured: { url: string; init: RequestInit }[] = [];
+  const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    captured.push({ url: String(url), init: init ?? {} });
+    if (String(url).endsWith('/enroll/nonce')) {
+      return new Response(JSON.stringify({ nonce: NONCE_B64URL, expires_in: 120 }), {
+        status: 200,
+      });
+    }
     return new Response(CRED_TEXT, {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -164,7 +222,7 @@ test('enroll posts the right body and returns the raw credential + parsed fields
 
   const result = await enroll({
     authorityUrl: 'https://authority.example.com/',
-    bootstrapToken: 'boot-tok',
+    bootstrapToken: 'boot-token',
     publicKey: EXPECTED_PUB,
     fetch: fakeFetch,
   });
@@ -174,27 +232,39 @@ test('enroll posts the right body and returns the raw credential + parsed fields
   assert.equal(result.agentId, 'agent-1');
   assert.equal(result.notAfter, '2026-07-10T01:00:00Z');
 
-  assert.equal(captured.length, 1);
-  const call = captured[0]!;
+  // Two legs: the nonce, then the enrollment.
+  assert.equal(captured.length, 2);
+  assert.equal(captured[0]!.url, 'https://authority.example.com/enroll/nonce');
+
+  const call = captured[1]!;
   assert.equal(call.url, 'https://authority.example.com/enroll');
   assert.equal(call.init.method, 'POST');
   const sentHeaders = call.init.headers as Record<string, string>;
   assert.equal(sentHeaders['Content-Type'], 'application/json');
   const parsedBody = JSON.parse(String(call.init.body)) as {
+    nonce: string;
     evidence: string;
     public_key: string;
   };
-  // evidence is base64url(utf8(bootstrapToken))
-  assert.equal(parsedBody.evidence, Buffer.from('boot-tok', 'utf8').toString('base64url'));
+  assert.equal(parsedBody.nonce, NONCE_B64URL);
+  // The bootstrap token is NOT on the wire; the evidence is a MAC over nonce + key.
+  assert.equal(parsedBody.evidence, EXPECTED_EVIDENCE);
   assert.equal(parsedBody.public_key, EXPECTED_PUB);
+  assert.ok(!String(call.init.body).includes('boot-token'));
 });
 
 test('enroll throws with status and body on non-200', async () => {
-  const fakeFetch = (async () =>
-    new Response('enrollment denied: attestation rejected', {
+  const fakeFetch = (async (url: string | URL | Request) => {
+    if (String(url).endsWith('/enroll/nonce')) {
+      return new Response(JSON.stringify({ nonce: NONCE_B64URL, expires_in: 120 }), {
+        status: 200,
+      });
+    }
+    return new Response('enrollment denied: attestation rejected', {
       status: 403,
       statusText: 'Forbidden',
-    })) as unknown as typeof fetch;
+    });
+  }) as unknown as typeof fetch;
 
   await assert.rejects(
     () =>

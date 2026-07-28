@@ -105,7 +105,12 @@ func enroll(args []string) {
 	if err != nil {
 		log.Fatalf("enroll: %v", err)
 	}
-	cred, err := workload.Enroll(context.Background(), nil, *authority, []byte(*token), pub)
+	// The bootstrap token stays here: what goes on the wire is a MAC over the authority's
+	// nonce and this public key, so it enrolls this key once and nothing else.
+	cred, err := workload.Enroll(context.Background(), nil, *authority, pub,
+		func(nonce []byte, pub ed25519.PublicKey) ([]byte, error) {
+			return workload.BootstrapEvidence(*token, nonce, pub), nil
+		})
 	if err != nil {
 		log.Fatalf("enroll: %v", err)
 	}

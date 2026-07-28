@@ -15,6 +15,10 @@
  *   - All base64 is RFC 4648 URL-safe with NO padding (Go's base64.RawURLEncoding,
  *     Node's `buf.toString('base64url')`). Decoding tolerates missing padding.
  *   - Cryptography is Ed25519.
+ *   - Enrolling is two requests: fetch a single-use nonce from the authority, then
+ *     present attestation evidence covering both that nonce and the public key being
+ *     enrolled. That binding is what stops an enrollment captured off the wire from
+ *     being replayed with somebody else's key.
  *
  * Zero runtime dependencies: only Node.js built-ins (`node:crypto`, global fetch).
  * Requires Node >= 18 (global fetch). Ed25519 support in `node:crypto` requires a
@@ -22,6 +26,7 @@
  */
 
 import {
+  createHmac,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
@@ -168,18 +173,81 @@ export interface EnrollResult {
 }
 
 /**
- * Present a bootstrap token plus the instance public key to the authority's
- * `POST /enroll` endpoint and receive a short-lived workload credential. Mirrors the
- * client side of Go's `workload.Enroll`.
+ * Build the attestation evidence a Go `workload.TokenAttestor` accepts: an HMAC-SHA256,
+ * keyed by the bootstrap token, over the authority-issued nonce and the public key being
+ * enrolled. Mirrors Go's `workload.BootstrapEvidence` byte-for-byte.
+ *
+ * The bootstrap token never leaves the process, and the result only enrolls this key
+ * against this nonce — so an enrollment captured off the wire cannot be replayed with
+ * somebody else's key.
+ */
+export function bootstrapEvidence(
+  bootstrapToken: string,
+  nonce: Buffer | Uint8Array,
+  publicKey: Buffer | Uint8Array,
+): Buffer {
+  // The MAC input is the canonical JSON Go signs over: {"ctx","nonce","pub"} in that
+  // field order, with nonce/pub as standard (padded) base64 — Go's encoding of []byte.
+  const msg = JSON.stringify({
+    ctx: 'sanad/bootstrap-evidence/v1',
+    nonce: Buffer.from(nonce).toString('base64'),
+    pub: Buffer.from(publicKey).toString('base64'),
+  });
+  return createHmac('sha256', Buffer.from(bootstrapToken, 'utf8')).update(msg).digest();
+}
+
+/**
+ * Fetch a single-use enrollment nonce from the authority's `POST /enroll/nonce`.
+ * Mirrors Go's `workload.RequestNonce`.
+ *
+ * The nonce is the RATS freshness challenge (carried as EAT `eat_nonce`): the authority
+ * accepts it exactly once, within a short window, so an attestation built over it cannot
+ * be replayed.
+ */
+export async function requestNonce(
+  authorityUrl: string,
+  doFetch: typeof fetch = fetch,
+): Promise<Buffer> {
+  const url = authorityUrl.replace(/\/+$/, '') + '/enroll/nonce';
+  const resp = await doFetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  const text = await resp.text();
+  if (resp.status !== 200) {
+    throw new Error(`enroll: ${resp.status} ${resp.statusText}: ${text.trim()}`);
+  }
+  const parsed = JSON.parse(text) as { nonce?: unknown };
+  if (typeof parsed.nonce !== 'string' || parsed.nonce === '') {
+    throw new Error('enroll: authority returned an unusable nonce');
+  }
+  return b64urlDecode(parsed.nonce);
+}
+
+/**
+ * Obtain a short-lived workload credential. Mirrors the client side of Go's
+ * `workload.Enroll`, which is two requests:
+ *
+ *   1. `POST /enroll/nonce` for a single-use challenge, then
+ *   2. `POST /enroll` with that nonce, evidence covering it and the instance public key,
+ *      and the public key itself.
  *
  * On HTTP 200 the response body is kept as the raw credential text. On any non-200
  * status this throws an Error including the status and response body.
  */
 export async function enroll(opts: EnrollOptions): Promise<EnrollResult> {
   const doFetch = opts.fetch ?? fetch;
+  const pub = b64urlDecode(opts.publicKey);
+  if (pub.length !== ED25519_PUBLIC_LEN) {
+    throw new Error(`enroll: instance public key must be ${ED25519_PUBLIC_LEN} bytes`);
+  }
+
+  const nonce = await requestNonce(opts.authorityUrl, doFetch);
   const url = opts.authorityUrl.replace(/\/+$/, '') + '/enroll';
   const body = JSON.stringify({
-    evidence: b64urlUtf8(opts.bootstrapToken),
+    nonce: b64url(nonce),
+    evidence: b64url(bootstrapEvidence(opts.bootstrapToken, nonce, pub)),
     public_key: opts.publicKey,
   });
 

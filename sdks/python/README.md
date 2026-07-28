@@ -60,6 +60,19 @@ print(resp.status, resp.text())
 
 See [`examples/quickstart.py`](examples/quickstart.py) for a runnable version.
 
+## Enrollment
+
+Enrollment is two requests to the authority:
+
+1. `POST {authority_url}/enroll/nonce` → `{"nonce": base64url(bytes), "expires_in": <seconds>}`.
+   Single-use and short-lived.
+2. `POST {authority_url}/enroll` with `{"nonce": ..., "evidence": ..., "public_key": ...}`,
+   all base64url. The 200 body is the credential JSON.
+
+The evidence must cryptographically cover **both** the nonce and the public key, or the
+authority refuses it — so an enrollment captured off the wire cannot be replayed with a
+different key. `enroll()` does both legs for you.
+
 ## What it sends
 
 Requests go to `${gateway_url}/servers/${server_id}${path}`. On every request the
@@ -80,6 +93,11 @@ the SDK encodes the **exact bytes** returned by enrollment.
 - `generate_instance_key() -> dict` — `{"private_key": base64url(seed||pub), "public_key": base64url(pub)}`.
 - `public_key_of(private_key: str) -> str` — accepts a 32-byte seed or 64-byte `seed||pub` (base64url).
 - `proof(private_key: str, principal_token: str) -> str`.
+- `bootstrap_evidence(bootstrap_token, nonce: bytes, public_key: bytes) -> bytes` — the
+  attestation evidence a Go `workload.TokenAttestor` accepts: HMAC-SHA256 keyed by the
+  bootstrap token over the nonce and the key being enrolled. The token never leaves the
+  process, and the result only enrolls *that* key against *that* nonce.
+- `request_nonce(authority_url) -> bytes` — the single-use enrollment challenge.
 - `enroll(authority_url, bootstrap_token, public_key) -> dict` — `{"credential": <raw text>, "agent_id", "not_after"}`.
 - `class PassportClient(gateway_url, instance_key, credential, delegation=None)`
   - `.headers(principal_token) -> dict`
@@ -95,8 +113,10 @@ dict from `enroll()`.
 
 - `generate_instance_key()["private_key"]` is byte-compatible with a key written by
   `passport keygen` (base64url of `seed(32) || pub(32)`).
-- The credential text returned by `enroll()` is byte-identical to what
-  `passport enroll` saves; store it verbatim.
+- `enroll()` speaks the same two-leg wire protocol as `workload.Enroll`, and
+  `bootstrap_evidence()` reproduces `workload.BootstrapEvidence` byte-for-byte.
+- The credential text returned by `enroll()` is the authority's response body verbatim;
+  store it as-is (`passport enroll` saves an indented copy of the same credential).
 
 ## Tests
 

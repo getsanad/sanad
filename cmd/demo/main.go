@@ -79,7 +79,10 @@ func main() {
 	att := workload.NewTokenAttestor()
 	att.Register("boot-token", "agent-1")
 	authority, _ := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
-	agentCred, _ := authority.Issue([]byte("boot-token"), a1Pub)
+	// Enrollment answers a single-use nonce from the authority with evidence that covers the
+	// key being enrolled, so a captured attestation cannot be replayed with a different key.
+	nonce, _ := authority.Nonce()
+	agentCred, _ := authority.Issue(workload.BootstrapEvidence("boot-token", nonce, a1Pub), nonce, a1Pub)
 	credHdr, _ := workload.EncodeCredential(agentCred)
 
 	chain, _ := delegation.NewRoot(principalPriv, principalDID, "agent-1", delegation.Grant{Tools: []string{"read"}})
@@ -87,7 +90,7 @@ func main() {
 
 	section("Setup")
 	fmt.Println("- Issued a Verifiable Credential for the principal (did:key)")
-	fmt.Println("- Issued a short-lived workload credential for agent-1 (via attestation)")
+	fmt.Println("- Issued a short-lived workload credential for agent-1 (via nonce-bound attestation)")
 	fmt.Println("- Built delegation chain: principal -> agent-1, scope=[read]")
 
 	// --- gateway + a fake protected MCP server ------------------------------------

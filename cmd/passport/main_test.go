@@ -39,7 +39,8 @@ func TestSidecarInjectsCredentials(t *testing.T) {
 	att.Register("boot", "agent-1")
 	authority, _ := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
 	a1Pub, a1Priv := mustKey(t)
-	cred, _ := authority.Issue([]byte("boot"), a1Pub)
+	nonce, _ := authority.Nonce()
+	cred, _ := authority.Issue(workload.BootstrapEvidence("boot", nonce, a1Pub), nonce, a1Pub)
 	credHeader, _ := workload.EncodeCredential(cred)
 
 	// Principal key + delegation chain principal -> agent-1.

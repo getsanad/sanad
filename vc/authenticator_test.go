@@ -107,7 +107,8 @@ func TestLivePipelineWithVCPrincipal(t *testing.T) {
 	att.Register("boot", "agent-1")
 	authority, _ := workload.NewAuthority(caPriv, "ca-1", att, time.Hour)
 	a1Pub, a1Priv := kp(t)
-	agentCred, _ := authority.Issue([]byte("boot"), a1Pub)
+	nonce, _ := authority.Nonce()
+	agentCred, _ := authority.Issue(workload.BootstrapEvidence("boot", nonce, a1Pub), nonce, a1Pub)
 
 	store := workload.NewKeyStore(caPub)
 	vcAuth := NewAuthenticator(StaticTrust{issuerDID: true}, WithKeyRegistrar(store))

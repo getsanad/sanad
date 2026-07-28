@@ -3,6 +3,11 @@
 // and proves itself to the Authority, which returns a signed credential binding the agent
 // id to that public key for a short time. There is no long-lived shared secret.
 //
+// Enrolling takes two steps: the instance fetches a single-use nonce from the Authority,
+// then presents attestation evidence covering both that nonce and the public key it is
+// enrolling. Evidence that does not cover the key would let anyone who captured one
+// attestation mint a credential for that agent id bound to their own key.
+//
 // Instance mTLS (P2-02) will present this credential at the gateway; the KeyStore feeds
 // verified agent keys into delegation verification (P2-04), which is what makes multi-hop
 // delegation work end-to-end. Hardware-backed attestation is the high-assurance tier (P3-01);
@@ -11,6 +16,9 @@ package workload
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -20,14 +28,31 @@ import (
 // DefaultTTL is the credential lifetime when none is configured. Short by design (FR-4).
 const DefaultTTL = time.Hour
 
-// Attestor verifies attestation evidence and returns the agent id it proves. Real
-// implementations validate node/TEE/TPM attestation (P3-01).
+// NonceTTL bounds how long an enrollment nonce stays usable. It only has to cover one round
+// trip — fetch the nonce, build evidence over it, enroll — so it is deliberately tiny.
+const NonceTTL = 2 * time.Minute
+
+// nonceSize is the length of an enrollment nonce; EAT wants 8–64 bytes (RFC 9711 §4.1).
+const nonceSize = 32
+
+// maxOutstandingNonces caps the outstanding-nonce table. /enroll/nonce is unauthenticated,
+// so without a cap a caller could grow it without bound.
+const maxOutstandingNonces = 4096
+
+// Attestor verifies attestation evidence and returns the agent id it proves. The evidence
+// must cryptographically cover BOTH nonce — the single-use challenge the Authority issued
+// for this enrollment — and pubKey, the instance key the credential will be bound to. An
+// implementation that ignores either lets a quote captured from the network, a log or a CI
+// artifact be replayed to mint a credential for that agent id bound to an attacker's key.
+// Real implementations validate node/TEE/TPM attestation (P3-01).
 type Attestor interface {
-	Attest(evidence []byte) (agentID string, err error)
+	Attest(evidence, nonce []byte, pubKey ed25519.PublicKey) (agentID string, err error)
 }
 
 // TokenAttestor maps pre-registered bootstrap tokens to agent ids — a simple dev/self-host
-// attestor. It is concurrency-safe.
+// attestor. Its evidence is an HMAC keyed by the bootstrap token over the enrollment nonce
+// and the instance key (see BootstrapEvidence), so the token never crosses the wire and a
+// captured blob is worthless with any other key or nonce. It is concurrency-safe.
 type TokenAttestor struct {
 	mu     sync.RWMutex
 	tokens map[string]string // bootstrap token -> agentID
@@ -45,15 +70,38 @@ func (a *TokenAttestor) Register(token, agentID string) {
 	a.tokens[token] = agentID
 }
 
-// Attest implements Attestor.
-func (a *TokenAttestor) Attest(evidence []byte) (string, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	id, ok := a.tokens[string(evidence)]
-	if !ok || id == "" {
+// BootstrapEvidence builds the evidence a TokenAttestor accepts: an HMAC, keyed by the
+// bootstrap token, over the authority-issued nonce and the public key being enrolled. The
+// token stays on the client, and the result only enrolls that key against that nonce.
+//
+// The token is still a shared secret whose holder can enroll at will — making bootstrap
+// tokens single-use and expiring is a separate item; this only stops a captured enrollment
+// from being replayed with someone else's key.
+func BootstrapEvidence(token string, nonce []byte, pub ed25519.PublicKey) []byte {
+	msg, _ := json.Marshal(struct {
+		Ctx   string `json:"ctx"`
+		Nonce []byte `json:"nonce"`
+		Pub   []byte `json:"pub"`
+	}{"sanad/bootstrap-evidence/v1", nonce, pub})
+	m := hmac.New(sha256.New, []byte(token))
+	m.Write(msg)
+	return m.Sum(nil)
+}
+
+// Attest implements Attestor. It trials each registered token: the token is not on the wire
+// to look up, and a dev/self-host attestor holds a handful of them.
+func (a *TokenAttestor) Attest(evidence, nonce []byte, pubKey ed25519.PublicKey) (string, error) {
+	if len(pubKey) != ed25519.PublicKeySize || len(nonce) == 0 {
 		return "", errors.New("workload: attestation rejected")
 	}
-	return id, nil
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for token, id := range a.tokens {
+		if id != "" && hmac.Equal(evidence, BootstrapEvidence(token, nonce, pubKey)) {
+			return id, nil
+		}
+	}
+	return "", errors.New("workload: attestation rejected")
 }
 
 // Credential is a short-lived, CA-signed assertion binding an agent id to a public key.
@@ -66,13 +114,23 @@ type Credential struct {
 	Signature []byte
 }
 
-// Authority issues credentials after attestation, signing with its CA key.
+// Authority issues credentials after attestation, signing with its CA key. It also issues
+// the single-use nonces that attestation evidence must cover.
 type Authority struct {
 	caPriv ed25519.PrivateKey
 	kid    string
 	att    Attestor
 	ttl    time.Duration
 	now    func() time.Time
+
+	// Outstanding enrollment nonces (nonce -> expiry). This state is PROCESS-LOCAL: a nonce
+	// minted by one authority replica is unknown to every other, so enrollment across
+	// replicas only works if the two requests land on the same process. A single authority
+	// process is the supported deployment for now; sharing this table (with the KeyStore) is
+	// a Phase 3 durability item.
+	nonceMu  sync.Mutex
+	nonces   map[string]time.Time
+	nonceTTL time.Duration
 }
 
 // NewAuthority returns an Authority that signs with caPriv (key id kid) and attests via att.
@@ -86,7 +144,10 @@ func NewAuthority(caPriv ed25519.PrivateKey, kid string, att Attestor, ttl time.
 	if ttl <= 0 {
 		ttl = DefaultTTL
 	}
-	return &Authority{caPriv: caPriv, kid: kid, att: att, ttl: ttl, now: time.Now}, nil
+	return &Authority{
+		caPriv: caPriv, kid: kid, att: att, ttl: ttl, now: time.Now,
+		nonces: map[string]time.Time{}, nonceTTL: NonceTTL,
+	}, nil
 }
 
 // CAPublicKey returns the key used to verify issued credentials.
@@ -94,13 +155,60 @@ func (a *Authority) CAPublicKey() ed25519.PublicKey {
 	return a.caPriv.Public().(ed25519.PublicKey)
 }
 
-// Issue verifies the attestation evidence and returns a short-lived credential binding the
-// attested agent id to pubKey.
-func (a *Authority) Issue(evidence []byte, pubKey ed25519.PublicKey) (Credential, error) {
+// Nonce issues a single-use enrollment challenge — the nonce freshness model of the RATS
+// architecture (RFC 9334 §10.1), carried in the quote as EAT's eat_nonce. The evidence
+// presented to Issue must cover it, and it is accepted exactly once within NonceTTL, so a
+// quote captured from an earlier enrollment can never be presented again.
+func (a *Authority) Nonce() ([]byte, error) {
+	n := make([]byte, nonceSize)
+	if _, err := rand.Read(n); err != nil {
+		return nil, err
+	}
+	now := a.now().UTC()
+
+	a.nonceMu.Lock()
+	defer a.nonceMu.Unlock()
+	for k, exp := range a.nonces { // sweep: an expired nonce can never be used again
+		if !now.Before(exp) {
+			delete(a.nonces, k)
+		}
+	}
+	if len(a.nonces) >= maxOutstandingNonces {
+		return nil, errors.New("workload: too many outstanding enrollment nonces")
+	}
+	a.nonces[string(n)] = now.Add(a.nonceTTL)
+	return n, nil
+}
+
+// consumeNonce accepts a nonce exactly once, inside its window. It is spent whether or not
+// the enrollment that follows succeeds, so a caller cannot retry attestations against one
+// challenge; an unknown, expired or already-spent nonce fails closed.
+func (a *Authority) consumeNonce(nonce []byte) error {
+	a.nonceMu.Lock()
+	defer a.nonceMu.Unlock()
+	exp, ok := a.nonces[string(nonce)]
+	if !ok {
+		return errors.New("workload: unknown or already-used enrollment nonce")
+	}
+	delete(a.nonces, string(nonce))
+	if !a.now().UTC().Before(exp) {
+		return errors.New("workload: enrollment nonce expired")
+	}
+	return nil
+}
+
+// Issue spends the enrollment nonce, verifies that the attestation evidence covers both that
+// nonce and pubKey, and returns a short-lived credential binding the attested agent id to
+// pubKey. Evidence that does not cover this exact key is rejected, so a captured quote
+// cannot be re-presented with an attacker's key.
+func (a *Authority) Issue(evidence, nonce []byte, pubKey ed25519.PublicKey) (Credential, error) {
 	if len(pubKey) != ed25519.PublicKeySize {
 		return Credential{}, errors.New("workload: invalid instance public key")
 	}
-	agentID, err := a.att.Attest(evidence)
+	if err := a.consumeNonce(nonce); err != nil {
+		return Credential{}, err
+	}
+	agentID, err := a.att.Attest(evidence, nonce, pubKey)
 	if err != nil {
 		return Credential{}, err
 	}

@@ -61,6 +61,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// Enrollment is two legs: the nonce the attestation must answer, then the enrollment.
+	mux.Handle("/enroll/nonce", workload.NonceHandler(authority))
 	mux.Handle("/enroll", workload.EnrollHandler(authority))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 

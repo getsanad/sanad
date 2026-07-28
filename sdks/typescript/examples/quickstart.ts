@@ -72,6 +72,14 @@ async function main(): Promise<void> {
 function makeFakeFetch(publicKeyB64: string): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
+    if (url.endsWith('/enroll/nonce')) {
+      // First leg of enrollment: the single-use challenge the evidence must cover.
+      const nonce = Buffer.alloc(32, 7).toString('base64url');
+      return new Response(JSON.stringify({ nonce, expires_in: 120 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     if (url.endsWith('/enroll')) {
       const cred = JSON.stringify({
         AgentID: 'agent-demo',

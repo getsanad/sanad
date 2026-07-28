@@ -192,7 +192,7 @@ func TestHolderProofDoesNotForgeACapabilityBlock(t *testing.T) {
 	}
 
 	// The attacker's own key, which they want the capability to end at.
-	attackerPub, _, err := ed25519.GenerateKey(rand.Reader)
+	attackerPub, attackerPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,16 +200,20 @@ func TestHolderProofDoesNotForgeACapabilityBlock(t *testing.T) {
 	// so the oracle is modelled at the primitive: a signature made under the holder-proof
 	// context over precisely the block's signing input must still not verify as a block.
 	stolenGrant := Grant{Tools: []string{"read"}}
-	proof := sigctx.Sign(sigctx.CapabilityHolderProof, holderSecret, blockMsg(stolenGrant, attackerPub))
+	msg := blockMsg(rootPub, 1, cap.Blocks[0].Signature, stolenGrant, attackerPub)
+	proof := sigctx.Sign(sigctx.CapabilityHolderProof, holderSecret, msg)
 
-	stolen := Capability{Blocks: append(append([]Block(nil), cap.Blocks...),
-		Block{Grant: stolenGrant, NextPub: attackerPub, Signature: proof})}
+	// Sealed by the attacker's own key, so only the block signature's context is under test:
+	// an unsealed capability would be rejected by the seal check whatever the block said.
+	stolenBlocks := append(append([]Block(nil), cap.Blocks...),
+		Block{Grant: stolenGrant, NextPub: attackerPub, Signature: proof})
+	stolen := Capability{Blocks: stolenBlocks, Seal: seal(attackerPriv, rootPub, stolenBlocks)}
 	if _, err := stolen.Verify(rootPub, time.Now()); err == nil {
 		t.Fatal("a holder proof was accepted as a capability block signature")
 	}
 
 	// A genuine attenuation by the holder still verifies.
-	att, _, err := cap.Attenuate(holderSecret, stolenGrant)
+	att, _, err := cap.Attenuate(rootPub, holderSecret, stolenGrant)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,12 +223,12 @@ func TestHolderProofDoesNotForgeACapabilityBlock(t *testing.T) {
 }
 
 func TestCapabilityBlockSignatureDoesNotForgeAHolderProof(t *testing.T) {
-	_, rootPriv := rootKeys(t)
+	rootPub, rootPriv := rootKeys(t)
 	cap, holderSecret, err := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	att, _, err := cap.Attenuate(holderSecret, Grant{Tools: []string{"read"}})
+	att, _, err := cap.Attenuate(rootPub, holderSecret, Grant{Tools: []string{"read"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,19 +302,22 @@ func TestDelegationHopDoesNotForgeACapabilityBlock(t *testing.T) {
 	const principalID = "principal-1"
 	rootPub, rootPriv := rootKeys(t)
 
-	nextPub, _, err := ed25519.GenerateKey(rand.Reader)
+	nextPub, nextPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	g := Grant{Tools: []string{"read"}}
 
-	// A hop whose canonical bytes were chosen to be a block's signing input.
-	msg := blockMsg(g, nextPub)
+	// A hop whose canonical bytes were chosen to be a block's signing input. The forged
+	// capability is correctly sealed with the next-secret, so the block signature's context is
+	// the only thing standing in the way.
+	msg := blockMsg(rootPub, 0, nil, g, nextPub)
 	chain, err := NewRoot(rootPriv, principalID, string(msg), g)
 	if err != nil {
 		t.Fatal(err)
 	}
-	forged := Capability{Blocks: []Block{{Grant: g, NextPub: nextPub, Signature: chain.Hops[0].Signature}}}
+	forgedBlocks := []Block{{Grant: g, NextPub: nextPub, Signature: chain.Hops[0].Signature}}
+	forged := Capability{Blocks: forgedBlocks, Seal: seal(nextPriv, rootPub, forgedBlocks)}
 	if _, err := forged.Verify(rootPub, time.Now()); err == nil {
 		t.Fatal("a delegation hop signature was accepted as a capability block signature")
 	}

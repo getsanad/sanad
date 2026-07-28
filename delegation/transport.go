@@ -20,7 +20,11 @@ func EncodeChain(c Chain) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// DecodeChain parses a chain from its header form.
+// DecodeChain parses a chain from its header form. An over-long chain is refused at the
+// transport boundary as well as at Verify: this is the first place the hop count is known,
+// and refusing it here keeps a header full of hops from being carried any further into the
+// pipeline. The ceiling here is the constant, never a per-stage tightening — DecodeChain has
+// no stage — so a stage that tightened it still rejects afterwards.
 func DecodeChain(s string) (Chain, error) {
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -29,6 +33,9 @@ func DecodeChain(s string) (Chain, error) {
 	var c Chain
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Chain{}, fmt.Errorf("delegation: bad chain: %w", err)
+	}
+	if len(c.Hops) > MaxDepth {
+		return Chain{}, fmt.Errorf("%w: chain has %d hops, the maximum is %d", ErrTooDeep, len(c.Hops), MaxDepth)
 	}
 	return c, nil
 }

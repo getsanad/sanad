@@ -2,7 +2,6 @@ package delegation
 
 import (
 	"crypto/ed25519"
-	"errors"
 	"fmt"
 	"time"
 
@@ -10,7 +9,9 @@ import (
 )
 
 // Verify checks the whole chain and returns the effective (most-narrowed) grant and the
-// acting agent (the final delegate). It enforces, for every hop:
+// acting agent (the final delegate). It first checks the chain's SHAPE — non-empty, within
+// the depth ceiling, no party twice (checkShape) — because those cost one pass over a slice
+// and the rest of this function costs one Ed25519 verification per hop. Then, for every hop:
 //   - the root delegator is the accountable principal (rootPrincipalID);
 //   - continuity: each delegator holds the delegation from the previous hop;
 //   - a valid signature by the delegator's registered key — resolved in the PRINCIPAL
@@ -19,9 +20,11 @@ import (
 //     and a signature that key made for some other purpose is not a hop);
 //   - attenuation-only against the previous hop (FR-11);
 //   - the hop has not expired at now.
-func Verify(c Chain, keys KeyRegistry, rootPrincipalID string, now time.Time) (Grant, string, error) {
-	if len(c.Hops) == 0 {
-		return Grant{}, "", errors.New("delegation: empty chain")
+func Verify(c Chain, keys KeyRegistry, rootPrincipalID string, now time.Time, opts ...VerifyOption) (Grant, string, error) {
+	// Before any cryptography: a chain too long to be honest, or one that loops, is refused
+	// here rather than after 4000 signature verifications have been paid for.
+	if err := c.checkShape(newVerifyOptions(opts).maxDepth); err != nil {
+		return Grant{}, "", err
 	}
 
 	var prevSig []byte

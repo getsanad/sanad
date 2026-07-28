@@ -60,8 +60,22 @@ const (
 	DelegationHop = "sanad/delegation-hop/v1"
 
 	// CapabilityBlock is the root or holder signature over one block of an offline capability
-	// (delegation.NewCapability / Capability.Attenuate / Verify).
-	CapabilityBlock = "sanad/capability-block/v1"
+	// (delegation.NewCapability / Capability.Attenuate / Verify). v2: v1 signed only (grant,
+	// nextPub), so a block was a free-floating object — nothing tied it to a position, to the
+	// block before it, or to the root key it hung from. v2 signs the root key, the block index
+	// and the previous block's signature as well, which is the same chaining Chain gets from
+	// prevSig. The label moved because a v1 block signature is a valid signature over a
+	// DIFFERENT statement than a v2 verifier reads it as; it now verifies under no context.
+	CapabilityBlock = "sanad/capability-block/v2"
+
+	// CapabilitySeal is the final holder's signature over the capability's own length
+	// (delegation.NewCapability / Capability.Attenuate / Verify). Block signatures chain
+	// forwards, and a forward chain cannot see its own tail being cut off — every prefix of a
+	// valid capability is itself a valid capability. The seal is the commitment to where the
+	// chain ENDS, and it must be its own context because the final next-secret already signs
+	// two other things: the next block (CapabilityBlock) and holder proofs
+	// (CapabilityHolderProof).
+	CapabilitySeal = "sanad/capability-seal/v1"
 
 	// CapabilityHolderProof is a capability holder proving possession of the final next-key
 	// (delegation.HolderProof / Capability.VerifyHolder). v2 for the same reason as
@@ -94,6 +108,7 @@ var All = []string{
 	BootstrapEvidence,
 	DelegationHop,
 	CapabilityBlock,
+	CapabilitySeal,
 	CapabilityHolderProof,
 	ExchangeToken,
 	AuditCheckpoint,

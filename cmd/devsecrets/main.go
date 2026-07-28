@@ -1,7 +1,8 @@
 // Command devsecrets generates a coherent set of DEVELOPMENT secrets and identities for the
 // docker-compose stack, so the whole system can process a real authenticated request
-// locally. It writes a .env (consumed by deploy/docker-compose.yml) plus a principal
-// bearer token and a delegation chain the agent-side CLI can use.
+// locally. It writes a .env (consumed by deploy/docker-compose.yml) plus the principal's
+// credential, the principal's private key (which the sidecar proves possession of on every
+// request), and a delegation chain the agent-side CLI can use.
 //
 //	go run ./cmd/devsecrets --out deploy
 //
@@ -92,12 +93,18 @@ PASSPORT_ADMIN_TOKEN=%s
 
 	writeFile(filepath.Join(*out, ".env"), []byte(env), 0o600)
 	writeFile(filepath.Join(secretsDir, "principal.token"), []byte(principalToken), 0o600)
+	// The credential alone authenticates nothing: the gateway also requires a per-request
+	// proof of possession of the principal's key (vc.HolderProof), which the sidecar builds
+	// from this file. Nothing else in the stack ever sees it.
+	writeFile(filepath.Join(secretsDir, "principal.key"), []byte(b64(principalPriv)), 0o600)
 	writeFile(filepath.Join(secretsDir, "delegation.json"), chainJSON, 0o600)
 
 	fmt.Printf(`
 Wrote dev secrets to %q:
   .env                     -> docker-compose reads this
-  secrets/principal.token  -> the principal's VC bearer token
+  secrets/principal.token  -> the principal's VC (presented as the bearer token)
+  secrets/principal.key    -> the principal's did:key PRIVATE key; the sidecar proves
+                              possession of it on every request (holder binding)
   secrets/delegation.json  -> delegation chain principal -> %s (scope: read)
 
 Identities:
@@ -111,9 +118,9 @@ Next:
   go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token --key agent.key --out cred.json
   PASSPORT_PRINCIPAL_TOKEN=$(cat %s/secrets/principal.token) \
     go run ./cmd/passport proxy --gateway http://localhost:8080 --key agent.key --credential cred.json \
-      --delegation %s/secrets/delegation.json &
+      --principal-key %s/secrets/principal.key --delegation %s/secrets/delegation.json &
   curl -s localhost:7070/servers/demo/tools/list | jq .
-`, *out, agentID, issuerDID, principalDID, agentID, *out, *out, *out)
+`, *out, agentID, issuerDID, principalDID, agentID, *out, *out, *out, *out)
 }
 
 func writeFile(path string, b []byte, mode os.FileMode) {

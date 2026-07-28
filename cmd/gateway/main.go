@@ -35,7 +35,9 @@
 // PASSPORT_DEV_NO_AUTH=1; with no registered servers every request fails closed. Once a
 // workload CA enables delegation, a request carrying no chain is rejected unless
 // PASSPORT_ALLOW_DIRECT_PRINCIPAL=1. In vc mode, a configured workload CA lets principal
-// keys self-provision for delegation. The dev LocalSigner is replaced by KMS/HSM in P1-12.
+// keys self-provision for delegation, and every request must also carry an X-Principal-Proof
+// header — a proof of possession of the principal's did:key, bound to that request — or the
+// credential would be a bearer token. The dev LocalSigner is replaced by KMS/HSM in P1-12.
 package main
 
 import (
@@ -458,6 +460,11 @@ func approvalTimeout() (time.Duration, error) {
 // turns into a fatal startup error unless PASSPORT_DEV_NO_AUTH=1. In
 // VC mode a non-nil key store is wired as the registrar so authenticated principals'
 // did:key public keys self-provision for delegation.
+//
+// The kill-switch is wired into BOTH modes. revoke.Stage would catch a revoked principal
+// before anything is minted either way, but authentication is where a principal's key is
+// registered as a delegation root, and an asymmetry here is a trap for any pipeline that
+// wires an authenticator without that stage.
 func buildPrincipalAuth(ctx context.Context, ks principal.StatusChecker, store *workload.KeyStore) (principal.Authenticator, error) {
 	switch os.Getenv("PASSPORT_PRINCIPAL_MODE") {
 	case "vc":
@@ -471,11 +478,12 @@ func buildPrincipalAuth(ctx context.Context, ks principal.StatusChecker, store *
 				trust[did] = true
 			}
 		}
-		var opts []vc.Option
+		opts := []vc.Option{vc.WithStatusChecker(ks)}
 		if store != nil {
 			opts = append(opts, vc.WithKeyRegistrar(store))
 		}
-		log.Print("principal auth: VC mode")
+		log.Printf("principal auth: VC mode (callers must present %s, a proof of possession of the principal's did:key bound to each request)",
+			vc.HeaderPrincipalProof)
 		return vc.NewAuthenticator(trust, opts...), nil
 
 	case "", "oidc":

@@ -20,6 +20,9 @@ def main() -> None:
     gateway_url = os.environ.get("GATEWAY_URL", "https://gw.example.com")
     bootstrap_token = os.environ.get("BOOTSTRAP_TOKEN", "dev-bootstrap-token")
     principal_token = os.environ.get("PRINCIPAL_TOKEN", "dev-principal-token")
+    # In VC mode the principal token is a credential, not a bearer token: the gateway also
+    # wants a per-request proof of possession of the subject's did:key. Unset in OIDC mode.
+    principal_key = os.environ.get("PRINCIPAL_KEY") or None
     server_id = os.environ.get("SERVER_ID", "example-server")
 
     # 1) Generate an Ed25519 instance key. The private_key is interchangeable with
@@ -39,7 +42,9 @@ def main() -> None:
         credential = result["credential"]
 
         # 3) Build a client and make an authenticated request through the gateway.
-        client = PassportClient(gateway_url, key["private_key"], credential)
+        client = PassportClient(
+            gateway_url, key["private_key"], credential, principal_key=principal_key
+        )
         resp = client.request(
             server_id,
             "/mcp",

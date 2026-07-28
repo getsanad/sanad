@@ -14,14 +14,17 @@ import unittest
 from sanad import (
     CTX_CAPABILITY_HOLDER_PROOF,
     CTX_INSTANCE_PROOF,
+    CTX_VC_HOLDER_PROOF,
     HEADER_CREDENTIAL,
     HEADER_DELEGATION,
+    HEADER_PRINCIPAL_PROOF,
     HEADER_PROOF,
     PassportClient,
     bootstrap_evidence,
     capability_holder_proof,
     enroll,
     generate_instance_key,
+    principal_holder_proof,
     proof,
     proof_binding,
     proof_payload,
@@ -74,6 +77,14 @@ EXPECTED_HOLDER_PROOF = (
     "UlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2"
     "RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0"
     ".y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw"
+)
+# And under the principal (VC) holder context, which is what makes a principal credential
+# something other than a bearer token.
+EXPECTED_PRINCIPAL_PROOF = (
+    "eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQ"
+    "UlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2"
+    "RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0"
+    ".8TeIZgdZx6nsllD1fkMtIAD6WtXItJlK2C_D2-dOttLSHxPTH-HdKuVKEB6trOaoMHSfbadX2xyr6zjIcj6MBQ"
 )
 # The signing input the proof covers, as hex: 8-byte length || context label || payload.
 EXPECTED_PROOF_INPUT = (
@@ -173,6 +184,15 @@ class TestVectors(unittest.TestCase):
         self.assertEqual(got.split(".")[0], EXPECTED_PROOF.split(".")[0])
         self.assertNotEqual(got.split(".")[1], EXPECTED_PROOF.split(".")[1])
 
+    def test_principal_holder_proof_vector(self):
+        got = principal_holder_proof(SEED_B64, **vector_kwargs())
+        self.assertEqual(got, EXPECTED_PRINCIPAL_PROOF)
+        # Same payload as the other two; all three signatures differ, which is what stops a
+        # principal's did:key signature for one purpose being read as another.
+        self.assertEqual(got.split(".")[0], EXPECTED_PROOF.split(".")[0])
+        self.assertNotEqual(got.split(".")[1], EXPECTED_PROOF.split(".")[1])
+        self.assertNotEqual(got.split(".")[1], EXPECTED_HOLDER_PROOF.split(".")[1])
+
     def test_proof_is_bound_to_the_request(self):
         base = proof(SEED_B64, **vector_kwargs())
         for override in [
@@ -257,6 +277,33 @@ class TestClientHeaders(unittest.TestCase):
         self.assertEqual(payload["bh"], EXPECTED_BH)
         # No delegation header unless a chain was supplied.
         self.assertNotIn(HEADER_DELEGATION, h)
+        # No principal key configured (OIDC mode): no principal proof.
+        self.assertNotIn(HEADER_PRINCIPAL_PROOF, h)
+
+    def test_principal_proof_header_present_when_a_principal_key_is_configured(self):
+        from sanad import _load_private
+
+        client = PassportClient(
+            gateway_url="https://gw.example.com",
+            instance_key=SEED_B64,
+            credential=CREDENTIAL_TEXT,
+            principal_key=SEED_B64,
+        )
+        h = client.headers("demo", "/mcp", PRINCIPAL_TOKEN, method=METHOD, body=BODY)
+        header = h[HEADER_PRINCIPAL_PROOF]
+        payload = json.loads(_b64url_decode(header.split(".")[0]))
+        # Bound to this request, and to the credential being presented (ath).
+        self.assertEqual(payload["htm"], METHOD)
+        self.assertEqual(payload["htu"], TARGET)
+        self.assertEqual(payload["ath"], EXPECTED_ATH)
+        self.assertEqual(payload["bh"], EXPECTED_BH)
+        # Signed under the VC holder context, not the instance one: the same key produces a
+        # different signature for each, and the gateway checks them with different labels.
+        raw = _b64url_decode(header.split(".")[0])
+        expected = _b64url_encode(
+            _load_private(SEED_B64).sign(sigctx_message(CTX_VC_HOLDER_PROOF, raw))
+        )
+        self.assertEqual(header.split(".")[1], expected)
 
     def test_delegation_header_present_when_supplied(self):
         chain_text = '{"hops":[]}'

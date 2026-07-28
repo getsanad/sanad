@@ -97,6 +97,17 @@ const (
 
 	// VCProof is a credential issuer's proof over a verifiable credential (vc.Issue / Verify).
 	VCProof = "sanad/vc-proof/v1"
+
+	// VCHolderProof is the PRESENTER of a principal credential proving possession of the
+	// credential subject's did:key private key, over a request-bound payload (vc.HolderProof /
+	// vc.Authenticator). It is the W3C `proofPurpose: authentication` of a verifiable
+	// presentation, expressed as a label rather than as a JSON-LD term.
+	//
+	// It must differ from VCProof, and from DelegationHop: a principal's did:key signs all
+	// three (it roots delegation chains, and a self-issued credential makes issuer and subject
+	// the same key), so one untagged signature would be readable as any of them — a holder
+	// proof over attacker-chosen bytes would be a valid delegation from that principal.
+	VCHolderProof = "sanad/vc-holder-proof/v1"
 )
 
 // All is every registered context label. It exists so tests can assert the properties that
@@ -114,6 +125,7 @@ var All = []string{
 	AuditCheckpoint,
 	AuditWitness,
 	VCProof,
+	VCHolderProof,
 }
 
 // Message returns the domain-separated signing input for msg under ctx:

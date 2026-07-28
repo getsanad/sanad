@@ -44,13 +44,14 @@ client = PassportClient(
     gateway_url="https://gw.example.com",
     instance_key=key["private_key"],
     credential=credential,
-    # delegation="<delegation chain JSON>",  # optional
+    # principal_key="<principal did:key private key>",  # required in VC mode
+    # delegation="<delegation chain JSON>",             # optional
 )
 
 resp = client.request(
     "example-server",              # server_id registered at the gateway
     "/mcp",                        # upstream path (must start with "/")
-    principal_token="<opaque principal bearer token>",
+    principal_token="<principal bearer token>",
     method="POST",
     body=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
     headers={"Content-Type": "application/json"},
@@ -80,10 +81,17 @@ client sets:
 
 | Header | Value |
 | --- | --- |
-| `Authorization` | `Bearer <principal_token>` (you supply the opaque token) |
+| `Authorization` | `Bearer <principal_token>` (you supply the token) |
 | `X-Agent-Credential` | base64url(utf8(credential JSON text)) — encoded verbatim, never re-serialized |
 | `X-Agent-Proof` | `base64url(payload).base64url(Ed25519_sign(instance_priv, sigctx_message("sanad/instance-proof/v2", payload)))`, bound to this request — see `proof` below |
+| `X-Principal-Proof` | the same payload signed with the **principal's** `did:key` under `sanad/vc-holder-proof/v1` — only if a `principal_key` was provided, and **required** by gateways in VC mode |
 | `X-Agent-Delegation` | base64url(utf8(delegation chain text)) — only if a delegation chain was provided |
+
+A gateway in VC mode (`PASSPORT_PRINCIPAL_MODE=vc`) will not accept the principal
+credential on its own. The credential proves a trusted issuer vouched for a `did:key`;
+`X-Principal-Proof` proves the caller actually holds that key, on this request. Without it
+the credential would be worth exactly as much as a copy of it — which is what anything that
+sees one request's headers gets for free.
 
 The credential's embedded signature would break if the JSON were re-serialized, so
 the SDK encodes the **exact bytes** returned by enrollment.
@@ -109,6 +117,11 @@ the SDK encodes the **exact bytes** returned by enrollment.
 - `capability_holder_proof(holder_secret, method, target, principal_token, body=None, ...) -> str` —
   the `X-Agent-Capability-Proof` value: the same payload under
   `sanad/capability-holder-proof/v2`.
+- `principal_holder_proof(principal_key, method, target, principal_token, body=None, ...) -> str` —
+  the `X-Principal-Proof` value: the same payload under `sanad/vc-holder-proof/v1`, signed
+  with the private key of the credential **subject** (not the instance key, not the
+  issuer's). `principal_token` must be the credential string exactly as sent, since the
+  proof commits to it via `ath`.
 - `proof_target(url) -> str` — the `htu` value: the origin-form target (path plus query).
   The authority is deliberately absent, because the gateway sits behind TLS terminators,
   ingresses and the `passport proxy` sidecar, any of which can rewrite scheme or Host.
@@ -127,7 +140,7 @@ the SDK encodes the **exact bytes** returned by enrollment.
   process, and the result only enrolls *that* key against *that* nonce.
 - `request_nonce(authority_url) -> bytes` — the single-use enrollment challenge.
 - `enroll(authority_url, bootstrap_token, public_key) -> dict` — `{"credential": <raw text>, "agent_id", "not_after"}`.
-- `class PassportClient(gateway_url, instance_key, credential, delegation=None)`
+- `class PassportClient(gateway_url, instance_key, credential, delegation=None, principal_key=None)`
   - `.headers(server_id, path, principal_token, method="GET", body=None) -> dict` — the
     headers for **that request**; the proof is bound to its method, target and body.
   - `.url(server_id, path) -> str`
@@ -137,7 +150,7 @@ the SDK encodes the **exact bytes** returned by enrollment.
 
 `instance_key` accepts either the base64url private-key string or the dict from
 `generate_instance_key()`; `credential` accepts either the raw JSON text or the
-dict from `enroll()`.
+dict from `enroll()`; `principal_key` is a base64url private key (seed or `seed||pub`).
 
 ## Interop with the Go CLI
 

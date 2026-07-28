@@ -40,7 +40,7 @@ tamper-evident audit log and an investigation. No external setup needed.
 | `pkg/types/`, `pkg/passport/` | Shared domain types + the hardened EdDSA passport codec |
 | `gateway/` | Policy enforcement point (PEP): identity-aware reverse proxy + pipeline |
 | `principal/` | Principal authentication via OIDC |
-| `vc/` | Principal authentication via W3C Verifiable Credentials (`did:key`) |
+| `vc/` | Principal authentication via W3C-shaped Verifiable Credentials (`did:key`), presented with a per-request proof of possession of the subject key |
 | `workload/` | Per-instance workload credentials + attestation (incl. measured/TEE) |
 | `delegation/` | Delegation: signed chains, centralized exchange, offline capability |
 | `policy/` | Authorization hook (deny-by-default allowlist + human-in-the-loop) |
@@ -223,7 +223,9 @@ go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token
   --key agent.key --out cred.json
 PASSPORT_PRINCIPAL_TOKEN=$(cat deploy/secrets/principal.token) \
   go run ./cmd/passport proxy --gateway http://localhost:8080 \
-    --key agent.key --credential cred.json --delegation deploy/secrets/delegation.json &
+    --key agent.key --credential cred.json \
+    --principal-key deploy/secrets/principal.key \
+    --delegation deploy/secrets/delegation.json &
 curl -s localhost:7070/servers/demo/tools/list | jq .
 ```
 
@@ -238,7 +240,10 @@ request: the **principal credential** (`Authorization: Bearer …`), its **workl
 credential** + proof (`X-Agent-Credential` / `X-Agent-Proof`), and its **delegation chain**
 (`X-Agent-Delegation`). The proof is bound to that one request — method, target, body hash,
 token hash, a timestamp and a one-time id, the DPoP shape from RFC 9449 — so a captured
-header bundle authenticates nothing else and cannot be presented twice. The gateway authenticates, mints a passport, and forwards only that
+header bundle authenticates nothing else and cannot be presented twice. In VC mode the
+principal credential is not a bearer token either: it comes with `X-Principal-Proof`, the
+same construction signed with the principal's `did:key`, so copying the credential out of a
+log or a proxy buys nothing without the key it names. The gateway authenticates, mints a passport, and forwards only that
 passport plus a minimal transport allowlist — every other inbound header (those credentials,
 cookies, API keys) is dropped, so a semi-trusted MCP server gets nothing it could replay
 (`PASSPORT_FORWARD_HEADERS` widens the allowlist). Once delegation is enabled a request with
@@ -250,12 +255,14 @@ the deployment sets `PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act d
   ```sh
   # operator runs the authority (issues credentials):  make run-authority
   passport enroll --authority https://authority.example.com --token <bootstrap-token>
+  # --principal-key is required by gateways in VC mode; omit it in OIDC mode.
   passport proxy  --gateway   https://gw.example.com --key agent.key --credential cred.json \
-                  --delegation chain.json   # agent now calls http://127.0.0.1:7070/servers/<id>/...
+                  --principal-key principal.key --delegation chain.json
+  # the agent now calls http://127.0.0.1:7070/servers/<id>/...
   ```
 - **Go agents:** use the `sdk` package (`sdk.New(gatewayURL, tokenSource).Call(...)`); add
-  `sdk.WithInstance(key, cred)` and `sdk.WithDelegation(chain)` to present a workload
-  identity, and the SDK builds a fresh proof for every call.
+  `sdk.WithInstance(key, cred)`, `sdk.WithPrincipalKey(key)` (VC mode) and
+  `sdk.WithDelegation(chain)`, and the SDK builds fresh proofs for every call.
 - **TypeScript / Python agents:** use the client SDKs in [`sdks/`](sdks/) — same enroll →
   request flow as the sidecar, in-process (`npm i @getsanad/sdk` / `pip install sanad-sdk`).
 - **AI coding agents:** the [`skills/sanad`](skills/sanad/SKILL.md) skill

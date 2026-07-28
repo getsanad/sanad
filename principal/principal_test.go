@@ -1,6 +1,7 @@
 package principal
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -126,6 +128,44 @@ func TestStageSetsPrincipalAndFailsClosed(t *testing.T) {
 		t.Fatalf("valid token: %v", err)
 	}
 	if req.Principal == nil || req.Principal.ID != "user-123" {
+		t.Fatalf("principal not set: %+v", req.Principal)
+	}
+}
+
+// requestAware records which of the two methods Stage reached. An authenticator whose
+// credential needs a proof bound to the request (vc.Authenticator) is useless if the stage
+// quietly takes the token-only path — the holder binding would simply never be checked.
+type requestAware struct {
+	sawRequest bool
+	sawBody    []byte
+}
+
+func (r *requestAware) Authenticate(context.Context, string) (*types.Principal, error) {
+	return nil, errors.New("token-only path must not be used")
+}
+
+func (r *requestAware) AuthenticateRequest(_ context.Context, _ string, req *http.Request, body []byte) (*types.Principal, error) {
+	r.sawRequest, r.sawBody = req != nil, body
+	return &types.Principal{ID: "did:key:zSubject"}, nil
+}
+
+func TestStagePrefersTheRequestAwareAuthenticator(t *testing.T) {
+	a := &requestAware{}
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	r := httptest.NewRequest(http.MethodPost, "/servers/demo/mcp", bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer credential")
+	req := &gateway.Request{HTTP: r, Body: body}
+
+	if err := Stage(a).Handle(context.Background(), req); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if !a.sawRequest {
+		t.Fatal("the stage did not pass the request to the request-aware authenticator")
+	}
+	if !bytes.Equal(a.sawBody, body) {
+		t.Fatalf("the stage passed body %q, want the buffered %q", a.sawBody, body)
+	}
+	if req.Principal == nil || req.Principal.ID != "did:key:zSubject" {
 		t.Fatalf("principal not set: %+v", req.Principal)
 	}
 }

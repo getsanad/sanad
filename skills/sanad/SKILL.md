@@ -10,14 +10,15 @@ long-lived API key, your agent presents **who it is** on each call and the gatew
 short-lived, task-scoped **passport** for the upstream. Your agent never sees or forwards the
 upstream's real credential.
 
-You attach four things to every request; the gateway checks them and fails closed if any is
-missing or wrong:
+You attach the following to every request; the gateway checks them and fails closed if any
+is missing or wrong:
 
 | Header | What it is |
 |---|---|
 | `Authorization: Bearer <principal-token>` | the accountable human/org (an OIDC token or a VC), given to you by your operator |
 | `X-Agent-Credential` | your short-lived workload credential, obtained by enrolling |
 | `X-Agent-Proof` | a signature proving you hold the instance key the credential is bound to |
+| `X-Principal-Proof` *(VC mode)* | a signature proving you hold the principal's `did:key` — a VC is not a bearer token, so a copy of the credential is not an identity |
 | `X-Agent-Delegation` *(optional)* | a signed chain narrowing what you're allowed to do |
 
 You do **not** build these by hand. Use one of the two paths below.
@@ -27,6 +28,9 @@ You do **not** build these by hand. Use one of the two paths below.
 - **Authority URL** for enrollment (e.g. `https://authority.example.com`)
 - **Bootstrap token** — proves to the authority which agent id you are
 - **Principal token** — the caller identity you act on behalf of (OIDC bearer, or a VC token)
+- **Principal key** — with a VC, the `did:key` private key of the credential's subject. The
+  gateway requires a per-request proof of possession of it; without the key the credential
+  authenticates nothing.
 - The **server id** of the protected MCP server you need (the gateway routes `/servers/<id>/…`)
 
 ## Path A — sidecar (zero code changes, recommended first)
@@ -39,9 +43,10 @@ agent's request-building changes.
 passport enroll --authority "$AUTHORITY_URL" --token "$BOOTSTRAP_TOKEN" \
   --key agent.key --out cred.json
 
-# 2. Run the sidecar. It injects all four headers and forwards to the gateway.
+# 2. Run the sidecar. It injects the headers above and forwards to the gateway.
 export PASSPORT_PRINCIPAL_TOKEN="$PRINCIPAL_TOKEN"
 passport proxy --gateway "$GATEWAY_URL" --key agent.key --credential cred.json
+# in VC mode add:  --principal-key principal.key
 # (optional) add:  --delegation delegation.json
 ```
 
@@ -65,7 +70,8 @@ from sanad import generate_instance_key, enroll, PassportClient
 
 key = generate_instance_key()                      # {"private_key","public_key"}
 cred = enroll(AUTHORITY_URL, BOOTSTRAP_TOKEN, key["public_key"])
-client = PassportClient(GATEWAY_URL, key["private_key"], cred["credential"])
+client = PassportClient(GATEWAY_URL, key["private_key"], cred["credential"],
+                        principal_key=PRINCIPAL_KEY)   # VC mode only
 
 resp = client.request("my-server", "/tools/list", principal_token=PRINCIPAL_TOKEN)
 print(resp.status, resp.body)
@@ -77,7 +83,8 @@ import { generateInstanceKey, enroll, PassportClient } from "@getsanad/sdk";
 
 const key = generateInstanceKey();
 const { credential } = await enroll({ authorityUrl: AUTHORITY_URL, bootstrapToken: BOOTSTRAP_TOKEN, publicKey: key.publicKey });
-const client = new PassportClient({ gatewayUrl: GATEWAY_URL, instanceKey: key.privateKey, credential });
+// principalKey is required in VC mode, omitted in OIDC mode.
+const client = new PassportClient({ gatewayUrl: GATEWAY_URL, instanceKey: key.privateKey, credential, principalKey: PRINCIPAL_KEY });
 
 const resp = await client.request("my-server", "/tools/list", { principalToken: PRINCIPAL_TOKEN });
 console.log(resp.status, await resp.text());
@@ -95,6 +102,9 @@ short-lived by design).
   This is intentional; contact the operator.
 - **`principal … is not trusted` / token invalid** — the principal token is wrong for this
   gateway (wrong issuer/audience). Get a fresh one from the operator.
+- **`vc: principal holder proof failed` / `expected exactly one X-Principal-Proof header`** —
+  the gateway is in VC mode and you presented the credential without proving you hold its
+  subject key. Supply the principal key (`--principal-key`, `principal_key=`, `principalKey`).
 - **404 for the path** — check the server id; the route is `/servers/<id>/<upstream-path>`.
 
 ## Notes

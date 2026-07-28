@@ -5,6 +5,35 @@
 // Because a did:key embeds the subject's public key, verifying a principal's VC also yields
 // that principal's key — which we register so delegation chains rooted at the principal
 // verify (closing the P2-02 gap). did:web (which needs network resolution) is a follow-up.
+//
+// # Presenting one requires the subject's key
+//
+// Verifying the issuer's signature says the credential is genuine. It says nothing about who
+// is holding it. Without a second check the credential is a bearer token whose bearer is a
+// human being's identity for its whole lifetime: copy the base64 out of one Authorization
+// header — from a log, a proxy, the upstream server — and you are that principal. That is the
+// exact property a key-based DID exists to avoid, since the subject's public key is sitting
+// right there in the identifier, unused.
+//
+// So presenting a credential also requires proving possession of the subject's private key,
+// over THIS request. HolderProof and Authenticator.AuthenticateRequest are that binding, and
+// holder.go documents why it is a request binding rather than a server-issued challenge.
+//
+// # This is a VC-shaped profile, not a JSON-LD implementation
+//
+// The credential is a W3C VC in shape — @context, type, credentialSubject, proof, all
+// enforced by Verify — but the proof is NOT one of the registered Data Integrity suites and
+// does not claim to be. Those are defined over JSON-LD canonicalization (URDNA2015) of the
+// credential graph; canonical signs a marshal of the Go struct, and the proof type says so
+// (see proofType). Two consequences worth stating plainly:
+//
+//   - A spec-conformant VC verifier will not verify these credentials, and this package will
+//     not verify credentials issued by one. Interoperating with the wider VC ecosystem means
+//     adopting URDNA2015 and a registered suite; that is a follow-up, not a claim made here.
+//   - Because the signing input is a struct marshal, a property the struct does not model is
+//     a property no signature covers. decodeCredential therefore REFUSES unknown properties
+//     rather than letting encoding/json drop them, which is what would otherwise let an
+//     unsigned field ride along invisibly through verification.
 package vc
 
 import (

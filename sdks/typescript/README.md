@@ -47,7 +47,8 @@ const client = new PassportClient({
   gatewayUrl: 'https://gw.example.com',
   instanceKey: key.privateKey,
   credential,
-  // delegation: delegationChainJsonText, // optional
+  // principalKey: principalDidKeyPrivateKey, // required by gateways in VC mode
+  // delegation: delegationChainJsonText,     // optional
 });
 
 const resp = await client.request('my-server', '/tools/list', {
@@ -111,6 +112,17 @@ for a `tools/call` of any tool.
 The `X-Agent-Capability-Proof` value: the same payload signed under
 `sanad/capability-holder-proof/v2`. Mirrors Go's `delegation.HolderProof`.
 
+### `principalHolderProof(principalKey: string, input: ProofInput): string`
+The `X-Principal-Proof` value: the same payload signed under `sanad/vc-holder-proof/v1`
+with the private key of the credential **subject**. Mirrors Go's `vc.HolderProof`.
+
+A gateway in VC mode (`PASSPORT_PRINCIPAL_MODE=vc`) will not accept the principal
+credential on its own. The credential proves a trusted issuer vouched for a `did:key`;
+this proves the caller actually holds that key, on this request. Without it the credential
+would be worth exactly as much as a copy of it — which is what anything that sees one
+request's headers gets for free. `input.principalToken` must be the credential string
+exactly as sent, since the proof commits to it via `ath`.
+
 ### `proofTarget(url: string): string`
 The `htu` value for a URL: the origin-form target (path plus query), which is what both
 ends can compute identically. The authority is deliberately absent — the gateway sits
@@ -150,13 +162,15 @@ in `credential` (plus `agentId` / `notAfter` parsed out for convenience). Throws
 non-200, including the status and response body.
 
 ### `class PassportClient`
-Constructed with `{ gatewayUrl, instanceKey, credential, delegation?, fetch? }`.
+Constructed with `{ gatewayUrl, instanceKey, credential, principalKey?, delegation?, fetch? }`.
 
 - `headers(serverId, path, opts): Record<string,string>` — builds the passport headers
   for **that request** (the proof is bound to its method, target and body):
   - `Authorization: Bearer <opts.principalToken>`
   - `X-Agent-Credential: base64url(utf8(credential))`
   - `X-Agent-Proof` — see `proof` above
+  - `X-Principal-Proof` — **only** when a `principalKey` was provided, and **required**
+    by gateways in VC mode. See `principalHolderProof` above.
   - `X-Agent-Delegation: base64url(utf8(delegation))` — **only** when a delegation
     chain was provided.
 - `url(serverId, path): string` — `${gatewayUrl}/servers/${serverId}${path}`.
@@ -227,4 +241,5 @@ The tests lock these fixed vectors (generated from the Go code) for the 32-byte 
 | `ath` for `"test-principal-token"` | `eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI` |
 | `bh` for an empty body | `47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU` |
 | `proof(seed, VECTOR_INPUT)` (see `test/vectors.mjs` for the pinned request, `iat` and `jti`) | `eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.xDlJ_BHqkqNCj1L4e4RqJsHSO_DE71uRiqALR6CRFdMSC-ICPY8rojK3uyy_coSbhDFQBT1mpL0ECFk8sIlpBw` |
+| `principalHolderProof(seed, VECTOR_INPUT)` — the same payload, VC holder context | `eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.8TeIZgdZx6nsllD1fkMtIAD6WtXItJlK2C_D2-dOttLSHxPTH-HdKuVKEB6trOaoMHSfbadX2xyr6zjIcj6MBQ` |
 | `bootstrapEvidence("boot-token", nonce, pub)` where nonce is `0x00..0x1f` | `umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o` |

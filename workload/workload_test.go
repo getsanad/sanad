@@ -131,19 +131,32 @@ func TestKeyStore(t *testing.T) {
 	if err := ks.Add(cred); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	got, ok := ks.PublicKey("agent-1")
+	got, ok := ks.AgentKey("agent-1")
 	if !ok || !got.Equal(pub) {
 		t.Fatal("agent key not resolvable after Add")
 	}
-	if _, ok := ks.PublicKey("unknown"); ok {
+	if _, ok := ks.AgentKey("unknown"); ok {
 		t.Fatal("unknown subject must not resolve")
 	}
+	// The agent's key lives in the agent namespace ONLY: the same id read as a principal
+	// resolves nothing.
+	if _, ok := ks.PrincipalKey("agent-1"); ok {
+		t.Fatal("an agent key must not resolve as a principal key")
+	}
 
-	// A directly-added principal key (no expiry) resolves.
+	// A directly-added principal key (no expiry) resolves — and only as a principal.
 	ppub, _ := newCA(t)
-	ks.AddKey("principal-1", ppub, time.Time{})
-	if _, ok := ks.PublicKey("principal-1"); !ok {
+	ks.AddPrincipalKey("principal-1", ppub, time.Time{})
+	if _, ok := ks.PrincipalKey("principal-1"); !ok {
 		t.Fatal("principal key should resolve")
+	}
+	if _, ok := ks.AgentKey("principal-1"); ok {
+		t.Fatal("a principal key must not resolve as an agent key")
+	}
+	// An empty id is not a subject: nothing may be registered under it.
+	ks.AddPrincipalKey("", ppub, time.Time{})
+	if _, ok := ks.PrincipalKey(""); ok {
+		t.Fatal("an empty principal id must not register a key")
 	}
 
 	// An expired credential is not cached.
@@ -162,12 +175,12 @@ func TestKeyStoreExpiryHidesKey(t *testing.T) {
 	// Inject a clock so we can cross the expiry deterministically.
 	base := time.Now()
 	ks.now = func() time.Time { return base }
-	ks.AddKey("agent-1", pub, base.Add(time.Minute))
-	if _, ok := ks.PublicKey("agent-1"); !ok {
+	ks.AddPrincipalKey("principal-1", pub, base.Add(time.Minute))
+	if _, ok := ks.PrincipalKey("principal-1"); !ok {
 		t.Fatal("key should resolve before expiry")
 	}
 	ks.now = func() time.Time { return base.Add(2 * time.Minute) }
-	if _, ok := ks.PublicKey("agent-1"); ok {
+	if _, ok := ks.PrincipalKey("principal-1"); ok {
 		t.Fatal("key must not resolve after expiry")
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -40,6 +41,47 @@ const nonceSize = 32
 // maxOutstandingNonces caps the outstanding-nonce table. /enroll/nonce is unauthenticated,
 // so without a cap a caller could grow it without bound.
 const maxOutstandingNonces = 4096
+
+// MaxAgentIDLen bounds an agent id. It is a name an operator picks for a workload, not a
+// payload, and an unbounded one is just something to put in a log line and a map key.
+const MaxAgentIDLen = 128
+
+// ValidAgentID reports whether id may name an agent. Agent ids and principal ids are separate
+// namespaces — KeyStore keeps their keys in separate maps — and this keeps them separate to
+// the eye as well as to the map: an agent id is a local, operator-chosen name (a leading
+// alphanumeric, then alphanumerics, '.', '_' or '-'), while every principal id Sanad accepts
+// is a URI-shaped global identifier: a did:key from a VC, an OIDC issuer/subject. No DID
+// method survives the charset, because every one of them carries the ':' that a scheme needs.
+//
+// It is a positive charset rather than a "reject anything starting did:" deny-list because a
+// deny-list only knows the id formats that exist today — adding did:web, a urn: or an
+// https:// principal id later would silently re-admit exactly the collision this rejects. The
+// same rule keeps agent ids clear of the ',' and '=' that PASSPORT_BOOTSTRAP_TOKENS parsing
+// splits on, and of whitespace and control characters, which make an audit line ambiguous.
+//
+// The namespaces would be separate without this: a DID-named agent gets a key in the agent
+// map and still cannot answer a principal lookup. This is the second lock — an agent that
+// prints in an audit trail as a principal is a lie about who is accountable even when it
+// resolves nothing.
+func ValidAgentID(id string) error {
+	if id == "" {
+		return errors.New("workload: agent id is empty")
+	}
+	if len(id) > MaxAgentIDLen {
+		return fmt.Errorf("workload: agent id is longer than %d bytes", MaxAgentIDLen)
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case i > 0 && (c == '.' || c == '_' || c == '-'):
+		default:
+			return fmt.Errorf("workload: agent id %q must be alphanumerics, '.', '_' or '-' and start with an alphanumeric "+
+				"(principal ids such as did:key:... are a different namespace and cannot be used to name an agent)", id)
+		}
+	}
+	return nil
+}
 
 // Attestor verifies attestation evidence and returns the agent id it proves. The evidence
 // must cryptographically cover BOTH nonce — the single-use challenge the Authority issued
@@ -65,11 +107,17 @@ func NewTokenAttestor() *TokenAttestor {
 	return &TokenAttestor{tokens: map[string]string{}}
 }
 
-// Register binds a bootstrap token to an agent id.
-func (a *TokenAttestor) Register(token, agentID string) {
+// Register binds a bootstrap token to an agent id. It rejects an id that is not a valid agent
+// name (ValidAgentID) — notably one shaped like a principal's DID — so a mistyped or hostile
+// entry fails where it is configured rather than at some later enrollment.
+func (a *TokenAttestor) Register(token, agentID string) error {
+	if err := ValidAgentID(agentID); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.tokens[token] = agentID
+	return nil
 }
 
 // BootstrapEvidence builds the evidence a TokenAttestor accepts: an HMAC, keyed by the
@@ -220,6 +268,13 @@ func (a *Authority) Issue(evidence, nonce []byte, pubKey ed25519.PublicKey) (Cre
 	if err != nil {
 		return Credential{}, err
 	}
+	// The authority is the only place an agent id becomes a signed identity, so it is where
+	// the name is held to the agent namespace — whatever Attestor produced it, including one
+	// an operator plugged in themselves. A credential is a CA signature over "this key IS this
+	// agent"; issuing one for a name that reads as a principal is issuing the wrong claim.
+	if err := ValidAgentID(agentID); err != nil {
+		return Credential{}, err
+	}
 	now := a.now().UTC()
 	c := Credential{
 		AgentID:   agentID,
@@ -239,6 +294,13 @@ func Verify(caPub ed25519.PublicKey, c Credential, now time.Time) error {
 	}
 	if len(c.PublicKey) != ed25519.PublicKeySize {
 		return errors.New("workload: credential has invalid public key")
+	}
+	// The verifier re-checks the agent id it is being asked to trust rather than assuming the
+	// issuing authority checked it: a credential with an empty id would otherwise register a
+	// key under "" in the KeyStore, and one named like a DID would put a principal id in
+	// req.Agent and in every audit line the request produces.
+	if err := ValidAgentID(c.AgentID); err != nil {
+		return err
 	}
 	if !sigctx.Verify(sigctx.WorkloadCredential, caPub, canonical(c), c.Signature) {
 		return errors.New("workload: bad credential signature")

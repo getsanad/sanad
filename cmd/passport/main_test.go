@@ -46,7 +46,7 @@ func TestSidecarInjectsCredentials(t *testing.T) {
 	// Principal key + delegation chain principal -> agent-1.
 	principalPub, principalPriv := mustKey(t)
 	store := workload.NewKeyStore(caPub)
-	store.AddKey("principal-1", principalPub, time.Time{})
+	store.AddPrincipalKey("principal-1", principalPub, time.Time{})
 	chain, _ := delegation.NewRoot(principalPriv, "principal-1", "agent-1", delegation.Grant{Tools: []string{"read"}})
 	chainHeader, _ := delegation.EncodeChain(chain)
 

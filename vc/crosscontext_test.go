@@ -35,7 +35,7 @@ func TestVCProofIsNotADelegationHop(t *testing.T) {
 	}
 
 	// The issuer's proof, presented as this principal's root delegation hop.
-	keys := delegation.MemKeyRegistry{did: pub}
+	keys := delegation.MemKeyRegistry{Principals: map[string]ed25519.PublicKey{did: pub}}
 	forged := delegation.Chain{Hops: []delegation.Hop{{
 		Delegator: did, Delegate: "agent-1",
 		Grant:     delegation.Grant{Tools: []string{"admin"}},

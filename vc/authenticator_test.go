@@ -40,7 +40,7 @@ type fakeRegistrar struct {
 	pub ed25519.PublicKey
 }
 
-func (f *fakeRegistrar) AddKey(id string, pub ed25519.PublicKey, _ time.Time) {
+func (f *fakeRegistrar) AddPrincipalKey(id string, pub ed25519.PublicKey, _ time.Time) {
 	f.id, f.pub = id, pub
 }
 

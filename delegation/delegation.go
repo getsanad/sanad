@@ -50,19 +50,35 @@ type Chain struct {
 	Hops []Hop
 }
 
-// KeyRegistry resolves a subject id (principal or agent) to its Ed25519 public key.
-// Principal keys come from registration/VCs (P2-08); agent keys from workload credentials
-// (P2-01/P2-02). MemKeyRegistry is the in-memory implementation.
+// KeyRegistry resolves a subject id to its Ed25519 public key. Principals and agents are
+// SEPARATE NAMESPACES with a method each: principal keys come from registration/VCs (P2-08),
+// agent keys from workload credentials (P2-01/P2-02). There is deliberately no "resolve this
+// id, whichever kind it is" method, and an implementation must not fall back from one
+// namespace to the other — one flat lookup is what let a workload credential issued for an
+// agent named after a principal's DID overwrite that principal's root key. Verify knows which
+// namespace each delegator belongs to from its position in the chain, so it never has to
+// guess. MemKeyRegistry and workload.KeyStore are the implementations.
 type KeyRegistry interface {
-	PublicKey(id string) (ed25519.PublicKey, bool)
+	PrincipalKey(id string) (ed25519.PublicKey, bool)
+	AgentKey(id string) (ed25519.PublicKey, bool)
 }
 
-// MemKeyRegistry is an in-memory KeyRegistry.
-type MemKeyRegistry map[string]ed25519.PublicKey
+// MemKeyRegistry is an in-memory KeyRegistry. The two namespaces are two maps, so the same
+// string appearing in both is two unrelated entries. A nil map resolves nothing.
+type MemKeyRegistry struct {
+	Principals map[string]ed25519.PublicKey
+	Agents     map[string]ed25519.PublicKey
+}
 
-// PublicKey implements KeyRegistry.
-func (m MemKeyRegistry) PublicKey(id string) (ed25519.PublicKey, bool) {
-	k, ok := m[id]
+// PrincipalKey implements KeyRegistry.
+func (m MemKeyRegistry) PrincipalKey(id string) (ed25519.PublicKey, bool) {
+	k, ok := m.Principals[id]
+	return k, ok
+}
+
+// AgentKey implements KeyRegistry.
+func (m MemKeyRegistry) AgentKey(id string) (ed25519.PublicKey, bool) {
+	k, ok := m.Agents[id]
 	return k, ok
 }
 

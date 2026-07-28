@@ -47,7 +47,7 @@ func TestDeepChainAllNarrowingVerifies(t *testing.T) {
 		newParty(t, "a1"), newParty(t, "a2"), newParty(t, "a3"),
 		newParty(t, "a4"), newParty(t, "a5"),
 	}
-	keys := registry(parties...)
+	keys := registry(parties[0], parties[1:]...)
 	grants := []Grant{
 		{Tools: []string{"read", "write", "delete", "list", "stat"}, Servers: []string{"s1", "s2", "s3"}, NotAfter: now.Add(5 * time.Hour), Budget: &types.Budget{Limit: 1000, Unit: "usd"}},
 		{Tools: []string{"read", "write", "delete", "list"}, Servers: []string{"s1", "s2"}, NotAfter: now.Add(4 * time.Hour), Budget: &types.Budget{Limit: 800, Unit: "usd"}},

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/internal/pop"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -18,7 +19,10 @@ type ChainExtractor func(req *gateway.Request) (chain Chain, present bool, err e
 // StageOption configures Stage or CapabilityStage.
 type StageOption func(*stageOptions)
 
-type stageOptions struct{ requireChain bool }
+type stageOptions struct {
+	requireChain bool
+	proof        []pop.Option // holder-proof freshness window / replay cache (CapabilityStage)
+}
 
 // WithRequireChain makes the stage fail closed when the request carries no delegation,
 // instead of letting the principal act directly. Without it delegation is opt-in per
@@ -27,6 +31,24 @@ type stageOptions struct{ requireChain bool }
 // (see Grant), hence strictly wider than the chain it actually holds. Deployments where
 // every caller is a delegate should always set this.
 func WithRequireChain() StageOption { return func(o *stageOptions) { o.requireChain = true } }
+
+// WithHolderProofWindow sets how old a capability holder proof may be and how far ahead its
+// iat may sit. The defaults (pop.DefaultMaxAge / pop.DefaultSkew) are what deployments should
+// use; this exists for tests and for clocks that are genuinely worse than NTP.
+func WithHolderProofWindow(maxAge, skew time.Duration) StageOption {
+	return func(o *stageOptions) { o.proof = append(o.proof, pop.WithWindow(maxAge, skew)) }
+}
+
+// WithHolderProofCacheEntries caps the per-process holder-proof replay cache. See
+// pop.ReplayCache for how to size it and what it does not cover across replicas.
+func WithHolderProofCacheEntries(n int) StageOption {
+	return func(o *stageOptions) { o.proof = append(o.proof, pop.WithCacheEntries(n)) }
+}
+
+// WithHolderProofClock replaces the holder-proof verifier's clock, for tests.
+func WithHolderProofClock(now func() time.Time) StageOption {
+	return func(o *stageOptions) { o.proof = append(o.proof, pop.WithClock(now)) }
+}
 
 func newStageOptions(opts []StageOption) stageOptions {
 	var o stageOptions

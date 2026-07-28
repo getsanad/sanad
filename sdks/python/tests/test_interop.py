@@ -12,15 +12,20 @@ import json
 import unittest
 
 from sanad import (
+    CTX_CAPABILITY_HOLDER_PROOF,
     CTX_INSTANCE_PROOF,
     HEADER_CREDENTIAL,
     HEADER_DELEGATION,
     HEADER_PROOF,
     PassportClient,
     bootstrap_evidence,
+    capability_holder_proof,
     enroll,
     generate_instance_key,
     proof,
+    proof_binding,
+    proof_payload,
+    proof_target,
     public_key_of,
     sigctx_message,
 )
@@ -39,14 +44,56 @@ PUB_B64 = "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
 NONCE_B64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 EXPECTED_EVIDENCE = "umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o"
 
+# The request one instance proof is bound to. A proof is per-request now, so the vector pins
+# the request too, and holds fixed the two inputs a real proof randomizes (iat, jti).
 PRINCIPAL_TOKEN = "test-principal-token"
-# The proof is over the domain-separated signing input, not the bare token.
-EXPECTED_PROOF = "_xyI6J0jruF9VJx5RZimoWtBtrH_7lFTueCgCdeSllnwDcTP5bxCQ9ponOj9OZSbidfO-89TiuC8QYwKBYmlDw"
-# That signing input, as hex: 8-byte big-endian length || context label || token.
-EXPECTED_PROOF_INPUT = (
-    "000000000000001773616e61642f696e7374616e63652d70726f6f662f76"
-    "31746573742d7072696e636970616c2d746f6b656e"
+METHOD = "POST"
+TARGET = "/servers/demo/mcp"
+BODY = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}'
+IAT = 1767225600  # 2026-01-01T00:00:00Z
+JTI = "AAECAwQFBgcICQoLDA0ODw"
+
+EXPECTED_ATH = "eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI"
+EXPECTED_BH = "qXDbbSbAIAqtTp_paFTD5GK3FpDPUyMfdw3M-BeWpWw"
+EXPECTED_BH_EMPTY = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+EXPECTED_PAYLOAD = (
+    '{"ath":"eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI",'
+    '"bh":"qXDbbSbAIAqtTp_paFTD5GK3FpDPUyMfdw3M-BeWpWw","htm":"POST",'
+    '"htu":"/servers/demo/mcp","iat":1767225600,"jti":"AAECAwQFBgcICQoLDA0ODw"}'
 )
+# base64url(payload) "." base64url(signature).
+EXPECTED_PROOF = (
+    "eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQ"
+    "UlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2"
+    "RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0"
+    ".xDlJ_BHqkqNCj1L4e4RqJsHSO_DE71uRiqALR6CRFdMSC-ICPY8rojK3uyy_coSbhDFQBT1mpL0ECFk8sIlpBw"
+)
+# The same payload signed under the capability holder context.
+EXPECTED_HOLDER_PROOF = (
+    "eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQ"
+    "UlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2"
+    "RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0"
+    ".y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw"
+)
+# The signing input the proof covers, as hex: 8-byte length || context label || payload.
+EXPECTED_PROOF_INPUT = (
+    "000000000000001773616e61642f696e7374616e63652d70726f6f662f76327b22617468223a2265615664633234"
+    "4d463572624b70545857444935572d7458484e6641312d7176466a7751344749686a6c49222c226268223a227158"
+    "4462625362414941717454705f706146544435474b334670445055794d666477334d2d426557705777222c226874"
+    "6d223a22504f5354222c22687475223a222f736572766572732f64656d6f2f6d6370222c22696174223a31373637"
+    "3232353630302c226a7469223a2241414543417751464267634943516f4c4441304f4477227d"
+)
+
+
+def vector_kwargs(**overrides):
+    """The vector's proof inputs, with iat and jti pinned."""
+    kwargs = dict(
+        method=METHOD, target=TARGET, principal_token=PRINCIPAL_TOKEN,
+        body=BODY, iat=IAT, jti=JTI,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
 
 CREDENTIAL_TEXT = (
     '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",'
@@ -90,35 +137,84 @@ class TestVectors(unittest.TestCase):
         # The length prefix is what disambiguates the split between label and message.
         self.assertNotEqual(sigctx_message("ab", b"c"), sigctx_message("a", b"bc"))
 
+    def test_proof_claim_vectors(self):
+        b = proof_binding(**vector_kwargs())
+        self.assertEqual(b["ath"], EXPECTED_ATH)
+        self.assertEqual(b["bh"], EXPECTED_BH)
+        # A request with no body still commits to one: the hash of zero bytes.
+        self.assertEqual(proof_binding(**vector_kwargs(body=None))["bh"], EXPECTED_BH_EMPTY)
+
+    def test_proof_payload_vector(self):
+        got = proof_payload(proof_binding(**vector_kwargs())).decode("utf-8")
+        print("proof payload =", got)
+        self.assertEqual(got, EXPECTED_PAYLOAD)
+
+    def test_proof_target(self):
+        self.assertEqual(proof_target("https://gw.example.com/servers/demo/mcp"), "/servers/demo/mcp")
+        self.assertEqual(proof_target("/servers/demo/mcp?cursor=abc"), "/servers/demo/mcp?cursor=abc")
+        # Percent-encoding is preserved, not decoded into a real separator.
+        self.assertEqual(proof_target("/servers/demo/a%2Fb"), "/servers/demo/a%2Fb")
+
     def test_proof_signing_input_vector(self):
-        got = sigctx_message(CTX_INSTANCE_PROOF, PRINCIPAL_TOKEN.encode("utf-8"))
+        payload = proof_payload(proof_binding(**vector_kwargs()))
+        got = sigctx_message(CTX_INSTANCE_PROOF, payload)
         print("proof signing input =", got.hex())
         self.assertEqual(got.hex(), EXPECTED_PROOF_INPUT)
 
     def test_proof_vector(self):
-        got = proof(SEED_B64, PRINCIPAL_TOKEN)
+        got = proof(SEED_B64, **vector_kwargs())
         print("proof =", got)
         self.assertEqual(got, EXPECTED_PROOF)
+
+    def test_capability_holder_proof_vector(self):
+        got = capability_holder_proof(SEED_B64, **vector_kwargs())
+        self.assertEqual(got, EXPECTED_HOLDER_PROOF)
+        # Same payload, different signature: an instance proof must not pass as a holder proof.
+        self.assertEqual(got.split(".")[0], EXPECTED_PROOF.split(".")[0])
+        self.assertNotEqual(got.split(".")[1], EXPECTED_PROOF.split(".")[1])
+
+    def test_proof_is_bound_to_the_request(self):
+        base = proof(SEED_B64, **vector_kwargs())
+        for override in [
+            {"method": "GET"},
+            {"target": "/servers/other/mcp"},
+            {"target": TARGET + "?x=1"},
+            {"principal_token": "another-token"},
+            {"body": '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'},
+            {"body": None},
+            {"iat": IAT + 1},
+            {"jti": "a-different-jti"},
+        ]:
+            self.assertNotEqual(proof(SEED_B64, **vector_kwargs(**override)), base, override)
+
+    def test_two_proofs_for_one_request_differ(self):
+        # A repeatable proof is a bearer token: whoever copies it is the instance.
+        kwargs = dict(method=METHOD, target=TARGET, principal_token=PRINCIPAL_TOKEN, body=BODY)
+        self.assertNotEqual(proof(SEED_B64, **kwargs), proof(SEED_B64, **kwargs))
 
     def test_proof_is_domain_separated_not_over_the_bare_token(self):
         from sanad import _b64url_encode, _load_private
 
         priv = _load_private(SEED_B64)
-        # The pre-domain-separation form: a raw signature over the token bytes. It must NOT
-        # be what the SDK sends — that signature would equally be a delegation hop signed by
-        # the same instance key, so the gateway rejects it.
+        # The pre-binding form: a signature over the token bytes. Ed25519 is deterministic,
+        # so that value was identical on every request for the token's lifetime — a bearer
+        # token with extra steps. The gateway rejects it.
         bare = _b64url_encode(priv.sign(PRINCIPAL_TOKEN.encode("utf-8")))
-        self.assertNotEqual(proof(SEED_B64, PRINCIPAL_TOKEN), bare)
+        self.assertNotEqual(proof(SEED_B64, **vector_kwargs()), bare)
 
-        tagged = _b64url_encode(
-            priv.sign(sigctx_message(CTX_INSTANCE_PROOF, PRINCIPAL_TOKEN.encode("utf-8")))
+        payload = proof_payload(proof_binding(**vector_kwargs()))
+        tagged = _b64url_encode(priv.sign(sigctx_message(CTX_INSTANCE_PROOF, payload)))
+        self.assertEqual(
+            proof(SEED_B64, **vector_kwargs()), _b64url_encode(payload) + "." + tagged
         )
-        self.assertEqual(proof(SEED_B64, PRINCIPAL_TOKEN), tagged)
+        # And the holder-proof context produces a different signature over those same bytes.
+        holder = _b64url_encode(priv.sign(sigctx_message(CTX_CAPABILITY_HOLDER_PROOF, payload)))
+        self.assertNotEqual(holder, tagged)
 
     def test_proof_same_for_seed_and_priv64(self):
         self.assertEqual(
-            proof(SEED_B64, PRINCIPAL_TOKEN),
-            proof(PRIV64_B64, PRINCIPAL_TOKEN),
+            proof(SEED_B64, **vector_kwargs()),
+            proof(PRIV64_B64, **vector_kwargs()),
         )
 
     def test_credential_header_vector(self):
@@ -149,10 +245,16 @@ class TestClientHeaders(unittest.TestCase):
             instance_key=SEED_B64,
             credential=CREDENTIAL_TEXT,
         )
-        h = client.headers(PRINCIPAL_TOKEN)
+        h = client.headers("demo", "/mcp", PRINCIPAL_TOKEN, method=METHOD, body=BODY)
         self.assertEqual(h["Authorization"], "Bearer " + PRINCIPAL_TOKEN)
         self.assertEqual(h[HEADER_CREDENTIAL], EXPECTED_CREDENTIAL_HEADER)
-        self.assertEqual(h[HEADER_PROOF], EXPECTED_PROOF)
+        # The proof is fresh per call, so the vector cannot be compared byte-for-byte; what
+        # is pinned is that it is bound to THIS request.
+        payload = json.loads(_b64url_decode(h[HEADER_PROOF].split(".")[0]))
+        self.assertEqual(payload["htm"], METHOD)
+        self.assertEqual(payload["htu"], TARGET)
+        self.assertEqual(payload["ath"], EXPECTED_ATH)
+        self.assertEqual(payload["bh"], EXPECTED_BH)
         # No delegation header unless a chain was supplied.
         self.assertNotIn(HEADER_DELEGATION, h)
 
@@ -164,7 +266,7 @@ class TestClientHeaders(unittest.TestCase):
             credential=CREDENTIAL_TEXT,
             delegation=chain_text,
         )
-        h = client.headers(PRINCIPAL_TOKEN)
+        h = client.headers("demo", "/mcp", PRINCIPAL_TOKEN)
         self.assertEqual(h[HEADER_DELEGATION], _b64url_encode(chain_text.encode("utf-8")))
 
     def test_credential_not_reserialized(self):
@@ -174,7 +276,7 @@ class TestClientHeaders(unittest.TestCase):
             instance_key=SEED_B64,
             credential=CREDENTIAL_TEXT,
         )
-        h = client.headers(PRINCIPAL_TOKEN)
+        h = client.headers("demo", "/mcp", PRINCIPAL_TOKEN)
         decoded = _b64url_decode(h[HEADER_CREDENTIAL]).decode("utf-8")
         self.assertEqual(decoded, CREDENTIAL_TEXT)
         # Sanity: it still parses as JSON but is byte-identical to the input text.
@@ -187,8 +289,13 @@ class TestClientHeaders(unittest.TestCase):
             instance_key=key,  # dict form
             credential={"credential": CREDENTIAL_TEXT},  # dict form (as enroll returns)
         )
-        h = client.headers(PRINCIPAL_TOKEN)
-        self.assertEqual(h[HEADER_PROOF], proof(key["private_key"], PRINCIPAL_TOKEN))
+        h = client.headers("demo", "/mcp", PRINCIPAL_TOKEN)
+        # The proof carries a fresh jti, so what is asserted is the binding, not the bytes.
+        payload = json.loads(_b64url_decode(h[HEADER_PROOF].split(".")[0]))
+        self.assertEqual(payload["htm"], "GET")
+        self.assertEqual(payload["htu"], "/servers/demo/mcp")
+        self.assertEqual(payload["ath"], EXPECTED_ATH)
+        self.assertEqual(payload["bh"], EXPECTED_BH_EMPTY)
 
     def test_request_url_construction(self):
         # Confirm the URL is /servers/{id}{path} without contacting a server, by

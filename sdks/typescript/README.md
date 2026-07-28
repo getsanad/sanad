@@ -73,10 +73,52 @@ Generate a fresh Ed25519 instance keypair. `privateKey` is base64url of the 64-b
 Return the base64url 32-byte public key for an instance private key. Accepts either a
 32-byte seed or a 64-byte `seed||pub` key (uses the first 32 bytes as the seed).
 
-### `proof(privateKey: string, principalToken: string): string`
-base64url of the Ed25519 signature, made with the instance key, over
-`sigctxMessage('sanad/instance-proof/v1', utf8(principalToken))`. This is the
-proof-of-possession sent as `X-Agent-Proof`.
+### `proof(privateKey: string, input: ProofInput): string`
+The `X-Agent-Proof` value for **one request**. `input` is
+`{ method, target, principalToken, body?, iat?, jti? }`; `iat` and `jti` default to now
+and to 128 fresh random bits and exist only for tests and pinned vectors.
+
+It is the DPoP construction (RFC 9449) in Sanad's signature format:
+
+```
+base64url(payload) "." base64url(ed25519_sign(instanceKey, sigctxMessage(ctx, payload)))
+```
+
+where `ctx` is `sanad/instance-proof/v2` and `payload` is compact JSON with the keys in
+this order:
+
+| Claim | Value |
+| --- | --- |
+| `ath` | `base64url(sha256(principalToken))` — RFC 9449 §4.2 |
+| `bh` | `base64url(sha256(body))`, the hash of zero bytes when there is none |
+| `htm` | the HTTP method |
+| `htu` | the origin-form target (see `proofTarget`) |
+| `iat` | creation time, Unix seconds |
+| `jti` | unique per proof |
+
+The gateway checks every claim against the request in front of it, requires the proof to
+be seconds old, and spends the `jti` on first use. **Do not cache the result** — a proof
+that is the same bytes twice is a bearer token, and the second request is rejected.
+
+Two departures from RFC 9449: the serialization is not a JWT (the key already arrives in
+a CA-signed workload credential, so DPoP's self-asserted `jwk` would be strictly weaker,
+and a parsed `alg` field is the root of the JWT confusion family); and the body IS
+covered, which §11.7 explicitly does not do — in MCP streamable HTTP every JSON-RPC
+message is POSTed to one endpoint, so method and path are identical for `tools/list` and
+for a `tools/call` of any tool.
+
+### `capabilityHolderProof(holderSecret: string, input: ProofInput): string`
+The `X-Agent-Capability-Proof` value: the same payload signed under
+`sanad/capability-holder-proof/v2`. Mirrors Go's `delegation.HolderProof`.
+
+### `proofTarget(url: string): string`
+The `htu` value for a URL: the origin-form target (path plus query), which is what both
+ends can compute identically. The authority is deliberately absent — the gateway sits
+behind TLS terminators, ingresses and the `passport proxy` sidecar, any of which can
+rewrite the scheme or the Host header. The query IS included, where RFC 9449 drops it.
+
+### `proofBinding(input) / proofPayload(binding)`
+The claim set and its canonical bytes, exposed so a caller can inspect or pin them.
 
 ### `sigctxMessage(ctx: string, message): Buffer`
 The domain-separated signing input Go's `sigctx.Message` produces:
@@ -110,10 +152,11 @@ non-200, including the status and response body.
 ### `class PassportClient`
 Constructed with `{ gatewayUrl, instanceKey, credential, delegation?, fetch? }`.
 
-- `headers(principalToken): Record<string,string>` — builds the passport headers:
-  - `Authorization: Bearer <principalToken>`
+- `headers(serverId, path, opts): Record<string,string>` — builds the passport headers
+  for **that request** (the proof is bound to its method, target and body):
+  - `Authorization: Bearer <opts.principalToken>`
   - `X-Agent-Credential: base64url(utf8(credential))`
-  - `X-Agent-Proof: base64url(ed25519_sign(instanceKey, sigctxMessage('sanad/instance-proof/v1', utf8(principalToken))))`
+  - `X-Agent-Proof` — see `proof` above
   - `X-Agent-Delegation: base64url(utf8(delegation))` — **only** when a delegation
     chain was provided.
 - `url(serverId, path): string` — `${gatewayUrl}/servers/${serverId}${path}`.
@@ -181,5 +224,7 @@ The tests lock these fixed vectors (generated from the Go code) for the 32-byte 
 | --- | --- |
 | `publicKeyOf(seed)` | `ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ` |
 | 64-byte `seed\|\|pub` form | `AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA` |
-| `proof(seed, "test-principal-token")` | `vS7aSzPmJd-D-AEAgbkw6oFU_0KU4rvei6aUlpCbrGn-nGkfVoqrvrV695SwkzT-id_8nXu18uleQye60FhWCQ` |
+| `ath` for `"test-principal-token"` | `eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI` |
+| `bh` for an empty body | `47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU` |
+| `proof(seed, VECTOR_INPUT)` (see `test/vectors.mjs` for the pinned request, `iat` and `jti`) | `eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.xDlJ_BHqkqNCj1L4e4RqJsHSO_DE71uRiqALR6CRFdMSC-ICPY8rojK3uyy_coSbhDFQBT1mpL0ECFk8sIlpBw` |
 | `bootstrapEvidence("boot-token", nonce, pub)` where nonce is `0x00..0x1f` | `umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o` |

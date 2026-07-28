@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/getsanad/sanad/delegation"
+	"github.com/getsanad/sanad/internal/mcprpc"
 	"github.com/getsanad/sanad/workload"
 )
 
@@ -68,7 +69,9 @@ Usage:
       --token-env VAR     env var with the principal bearer token (default PASSPORT_PRINCIPAL_TOKEN)
       --token-file FILE   file with the principal bearer token (overrides --token-env)
       --delegation FILE   delegation chain JSON (gateways with delegation enabled
-                          require one unless PASSPORT_ALLOW_DIRECT_PRINCIPAL=1)`)
+                          require one unless PASSPORT_ALLOW_DIRECT_PRINCIPAL=1)
+      --max-body BYTES    request body buffered to bind the proof (default 1 MiB;
+                          raise to match a gateway with a larger PASSPORT_MAX_REQUEST_BODY)`)
 	os.Exit(2)
 }
 
@@ -151,6 +154,7 @@ func runProxy(args []string) {
 	tokenEnv := fs.String("token-env", "PASSPORT_PRINCIPAL_TOKEN", "env var holding the principal bearer token")
 	tokenFile := fs.String("token-file", "", "file holding the principal bearer token (overrides --token-env)")
 	delegationFile := fs.String("delegation", "", "delegation chain JSON file (required by gateways with delegation enabled)")
+	maxBody := fs.Int64("max-body", 0, "bytes of request body buffered to bind the proof (0 = 1 MiB; must be >= the gateway's PASSPORT_MAX_REQUEST_BODY)")
 	_ = fs.Parse(args)
 
 	if *gatewayURL == "" || *keyFile == "" || *credFile == "" {
@@ -179,6 +183,7 @@ func runProxy(args []string) {
 		credHeader:  credHeader,
 		chainHeader: chainHeader,
 		token:       tokenSource(*tokenFile, *tokenEnv),
+		maxBody:     *maxBody,
 	})
 	if err != nil {
 		log.Fatalf("proxy: %v", err)
@@ -195,10 +200,25 @@ type sidecarConfig struct {
 	credHeader  string
 	chainHeader string
 	token       func() (string, error)
+	// maxBody caps the request body buffered to hash into the proof. It must be at least the
+	// gateway's own PASSPORT_MAX_REQUEST_BODY, or a body the gateway would have accepted is
+	// refused here first. Zero selects mcprpc.DefaultMaxBody, which is the gateway's default.
+	maxBody int64
 }
+
+// bodyKey carries the buffered request body from the outer handler to the Director. The
+// Director only receives the request, and the body is a one-shot reader it must not consume —
+// the reverse proxy is about to forward those exact bytes upstream — so the bytes travel on
+// the context, which ReverseProxy preserves when it clones the request.
+type bodyKey struct{}
 
 // newSidecar returns the reverse-proxy handler that injects passport credentials onto each
 // request before forwarding to the gateway.
+//
+// The proof is computed PER REQUEST and cannot be otherwise: it commits to this request's
+// method, target and body (workload.Proof). The previous sidecar built one proof at startup
+// and reused it for the process's lifetime, which is what made a captured header bundle worth
+// stealing — it was valid on every subsequent request too.
 func newSidecar(cfg sidecarConfig) (http.Handler, error) {
 	target, err := url.Parse(cfg.gatewayURL)
 	if err != nil {
@@ -207,20 +227,44 @@ func newSidecar(cfg sidecarConfig) (http.Handler, error) {
 	rp := httputil.NewSingleHostReverseProxy(target)
 	base := rp.Director
 	rp.Director = func(r *http.Request) {
-		base(r)
+		base(r) // rewrites scheme/host/path to the gateway's, so the target is now final
 		tok, err := cfg.token()
 		if err != nil {
 			// Leave credentials off; the gateway will deny (fail closed).
 			return
 		}
+		body, _ := r.Context().Value(bodyKey{}).([]byte)
+		proof, err := workload.Proof(cfg.instanceKey, r.Method, workload.ProofTarget(r.URL), tok, body)
+		if err != nil {
+			return // fail closed the same way: no proof, no admission
+		}
 		r.Header.Set("Authorization", "Bearer "+tok)
 		r.Header.Set(workload.HeaderCredential, cfg.credHeader)
-		r.Header.Set(workload.HeaderProof, workload.Proof(cfg.instanceKey, tok))
+		r.Header.Set(workload.HeaderProof, proof)
 		if cfg.chainHeader != "" {
 			r.Header.Set(delegation.HeaderDelegation, cfg.chainHeader)
 		}
 	}
-	return rp, nil
+
+	// Buffering happens here rather than in the Director because that is the only place with
+	// a ResponseWriter to cap the read against, and because the body has to be put back for
+	// the proxy to forward byte-for-byte. It is the same mcprpc.BufferBody the gateway uses,
+	// so both ends hash exactly the same bytes.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mcprpc.HasBody(r) {
+			body, err := mcprpc.BufferBody(w, r, cfg.maxBody)
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, mcprpc.ErrBodyTooLarge) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), bodyKey{}, body))
+		}
+		rp.ServeHTTP(w, r)
+	}), nil
 }
 
 func loadInstanceKey(path string) (ed25519.PrivateKey, error) {

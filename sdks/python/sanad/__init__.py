@@ -13,6 +13,14 @@ Every signature is domain-separated: it is made over
 ``uint64be(len(ctx)) || ctx || message``, where ``ctx`` names what is being signed
 (see :func:`sigctx_message`). Signing the bare message is not accepted by the gateway.
 
+The proof of possession is bound to ONE request. It is the DPoP construction (RFC 9449)
+in Sanad's signature format: a payload naming the method (``htm``), the target (``htu``),
+a hash of the principal token (``ath``), a hash of the body (``bh``), a creation time
+(``iat``) and a unique id (``jti``), signed under the instance-proof context. See
+:func:`proof` for why the body is covered when DPoP leaves it out. A proof therefore
+cannot be computed once and reused — that is the point, and a client that caches one is
+denied on its second request.
+
 Enrolling is two requests: the agent fetches a single-use nonce from the authority,
 then presents attestation evidence that covers both that nonce and the public key it
 is enrolling. That binding is what stops an enrollment captured off the wire from
@@ -35,7 +43,10 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
@@ -47,8 +58,14 @@ __all__ = [
     "generate_instance_key",
     "public_key_of",
     "proof",
+    "capability_holder_proof",
+    "request_proof",
+    "proof_binding",
+    "proof_payload",
+    "proof_target",
     "sigctx_message",
     "CTX_INSTANCE_PROOF",
+    "CTX_CAPABILITY_HOLDER_PROOF",
     "bootstrap_evidence",
     "request_nonce",
     "enroll",
@@ -71,7 +88,16 @@ _PUB_SIZE = 32
 _PRIV64_SIZE = 64  # seed(32) || public(32), matching Go's ed25519.PrivateKey
 
 # Context label for an instance proof of possession (Go's ``sigctx.InstanceProof``).
-CTX_INSTANCE_PROOF = "sanad/instance-proof/v1"
+#
+# ``v2`` because the proof changed meaning: ``v1`` signed the bare principal token, ``v2``
+# signs a request binding. The label moved so a ``v1`` proof cannot be replayed against the
+# new semantics — it now verifies under no context at all.
+CTX_INSTANCE_PROOF = "sanad/instance-proof/v2"
+
+# Context label for a capability holder proof (Go's ``sigctx.CapabilityHolderProof``). The
+# payload is the same shape as an instance proof; only the label differs, and that is what
+# stops one from being presented as the other when both are signed by keys that can coincide.
+CTX_CAPABILITY_HOLDER_PROOF = "sanad/capability-holder-proof/v2"
 
 
 class PassportError(Exception):
@@ -173,19 +199,142 @@ def sigctx_message(ctx: str, message: bytes) -> bytes:
     return len(label).to_bytes(8, "big") + label + message
 
 
-def proof(private_key: str, principal_token: str) -> str:
-    """Produce the proof of possession sent as ``X-Agent-Proof``.
+# --- Request-bound proof of possession (DPoP, RFC 9449) -------------------------
 
-    ``base64url(Ed25519_sign(priv, sigctx_message(CTX_INSTANCE_PROOF, utf8(token))))``.
+def _sha256_b64(data: bytes) -> str:
+    """base64url(SHA-256(data)) — the digest form both ``ath`` and ``bh`` use."""
+    return _b64url_encode(hashlib.sha256(data).digest())
 
-    Mirrors ``workload.Proof`` in the Go code and binds the instance key to the
-    specific short-lived principal token. Signing the bare token — as this SDK did
-    before the context was introduced — turns the instance key into a signing oracle
-    for anything else that key authenticates, so the gateway rejects such a signature.
+
+def proof_target(url: str) -> str:
+    """Return the ``htu`` value for a URL: the origin-form target the gateway will see.
+
+    Mirrors Go's ``pop.Target``. Accepts an absolute URL or a bare path.
+
+    The authority is deliberately absent: the gateway sits behind TLS terminators,
+    ingresses and the ``passport proxy`` sidecar, any of which can rewrite the scheme or
+    the Host header, so binding a value the two ends compute differently buys an outage
+    rather than security. The query IS included, where RFC 9449 drops it — nothing between
+    an agent and the gateway rewrites query strings, and covering it is strictly stronger.
+    """
+    parts = urllib.parse.urlsplit(url)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    return target
+
+
+def proof_binding(
+    method: str,
+    target: str,
+    principal_token: str,
+    body: Optional[Union[bytes, str]] = None,
+    iat: Optional[int] = None,
+    jti: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the claim set a proof commits to. Mirrors Go's ``pop.NewBinding``.
+
+    ``iat`` and ``jti`` default to now and to 128 fresh random bits (above the 96 RFC 9449
+    §4.2 asks for); pass them only for tests and pinned vectors.
+    """
+    if body is None:
+        raw = b""
+    elif isinstance(body, str):
+        raw = body.encode("utf-8")
+    else:
+        raw = body
+    return {
+        "ath": _sha256_b64(principal_token.encode("utf-8")),
+        "bh": _sha256_b64(raw),
+        "htm": method,
+        "htu": target,
+        "iat": int(time.time()) if iat is None else iat,
+        "jti": _b64url_encode(os.urandom(16)) if jti is None else jti,
+    }
+
+
+def proof_payload(binding: Dict[str, Any]) -> bytes:
+    """Serialize a binding to the canonical payload bytes.
+
+    Compact JSON with the keys in the order above, and ``ensure_ascii=False`` so the output
+    matches Go's ``pop.Encode`` (an encoder with HTML escaping off) and JavaScript's
+    ``JSON.stringify`` byte-for-byte.
+    """
+    ordered = {k: binding[k] for k in ("ath", "bh", "htm", "htu", "iat", "jti")}
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def request_proof(
+    ctx: str,
+    private_key: str,
+    method: str,
+    target: str,
+    principal_token: str,
+    body: Optional[Union[bytes, str]] = None,
+    iat: Optional[int] = None,
+    jti: Optional[str] = None,
+) -> str:
+    """Sign a request binding under ``ctx``, returning ``base64url(payload).base64url(sig)``.
+
+    Mirrors Go's ``pop.Sign``. The signature covers the payload bytes as transmitted, so the
+    gateway never re-encodes what it is checking and the three SDK languages cannot disagree
+    about JSON details.
     """
     priv = _load_private(private_key)
-    sig = priv.sign(sigctx_message(CTX_INSTANCE_PROOF, principal_token.encode("utf-8")))
-    return _b64url_encode(sig)
+    payload = proof_payload(proof_binding(method, target, principal_token, body, iat, jti))
+    sig = priv.sign(sigctx_message(ctx, payload))
+    return _b64url_encode(payload) + "." + _b64url_encode(sig)
+
+
+def proof(
+    private_key: str,
+    method: str,
+    target: str,
+    principal_token: str,
+    body: Optional[Union[bytes, str]] = None,
+    iat: Optional[int] = None,
+    jti: Optional[str] = None,
+) -> str:
+    """Produce the ``X-Agent-Proof`` value for ONE request. Mirrors ``workload.Proof``.
+
+    The proof commits to the method, the target, a hash of the principal token (``ath``) and
+    a hash of the body (``bh``), plus a creation time and a unique id. The gateway checks
+    each against the request in front of it, requires the proof to be seconds old, and spends
+    the ``jti`` on first use.
+
+    Two departures from RFC 9449 are worth knowing about. The serialization is not a JWT: the
+    key is already carried in a CA-signed workload credential, so DPoP's ``jwk`` header would
+    be strictly weaker, and a parsed ``alg`` field is the root of the whole JWT confusion
+    family. And the body IS covered, which RFC 9449 §11.7 explicitly does not do: in MCP
+    streamable HTTP every JSON-RPC message is POSTed to one endpoint, so method and path are
+    identical for ``tools/list`` and for a ``tools/call`` of any tool — a proof that stopped
+    at the URL would leave a captured header bundle usable to invoke anything.
+
+    Do NOT cache the result. Computing it once and reusing it is precisely the bug this
+    construction fixes, and the gateway rejects the second request.
+    """
+    return request_proof(
+        CTX_INSTANCE_PROOF, private_key, method, target, principal_token, body, iat, jti
+    )
+
+
+def capability_holder_proof(
+    holder_secret: str,
+    method: str,
+    target: str,
+    principal_token: str,
+    body: Optional[Union[bytes, str]] = None,
+    iat: Optional[int] = None,
+    jti: Optional[str] = None,
+) -> str:
+    """Produce the ``X-Agent-Capability-Proof`` value for one request.
+
+    The same binding as :func:`proof`, signed under the capability holder context. Mirrors
+    Go's ``delegation.HolderProof``.
+    """
+    return request_proof(
+        CTX_CAPABILITY_HOLDER_PROOF, holder_secret, method, target, principal_token, body, iat, jti
+    )
 
 
 # --- Enrollment -----------------------------------------------------------------
@@ -362,12 +511,34 @@ class PassportClient:
         self._credential_text = _credential_text(credential)
         self._delegation = delegation
 
-    def headers(self, principal_token: str) -> Dict[str, str]:
-        """Build the passport headers for a request bound to ``principal_token``."""
+    def url(self, server_id: str, path: str) -> str:
+        """Build the full gateway URL: ``{gateway_url}/servers/{server_id}{path}``."""
+        return f"{self.gateway_url}/servers/{server_id}{path}"
+
+    def headers(
+        self,
+        server_id: str,
+        path: str,
+        principal_token: str,
+        method: str = "GET",
+        body: Optional[Union[bytes, str]] = None,
+    ) -> Dict[str, str]:
+        """Build the passport headers for ONE request.
+
+        It takes the request — server, path, method and body — because the proof is bound to
+        all of them. The returned headers are good for that request and no other; building
+        them once and reusing them across calls is the bug this construction exists to fix.
+        """
         h = {
             "Authorization": "Bearer " + principal_token,
             HEADER_CREDENTIAL: _b64url_encode(self._credential_text.encode("utf-8")),
-            HEADER_PROOF: proof(self._private_key, principal_token),
+            HEADER_PROOF: proof(
+                self._private_key,
+                method,
+                proof_target(self.url(server_id, path)),
+                principal_token,
+                body,
+            ),
         }
         if self._delegation is not None:
             h[HEADER_DELEGATION] = _b64url_encode(self._delegation.encode("utf-8"))
@@ -395,15 +566,17 @@ class PassportClient:
         if not path.startswith("/"):
             raise PassportError("path must begin with '/'")
 
-        url = f"{self.gateway_url}/servers/{server_id}{path}"
-
-        all_headers = self.headers(principal_token)
-        if headers:
-            all_headers.update(headers)
+        url = self.url(server_id, path)
 
         data: Optional[bytes] = None
         if body is not None:
             data = body.encode("utf-8") if isinstance(body, str) else body
+
+        # The proof commits to a hash of the bytes actually sent, so it is built from `data`
+        # after encoding rather than from the caller's str/bytes union.
+        all_headers = self.headers(server_id, path, principal_token, method=method, body=data)
+        if headers:
+            all_headers.update(headers)
 
         req = urllib.request.Request(url, data=data, method=method, headers=all_headers)
         try:

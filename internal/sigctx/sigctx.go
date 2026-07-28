@@ -1,12 +1,12 @@
 // Package sigctx gives every signature in Sanad its own message space.
 //
 // One Ed25519 key here signs several different kinds of thing. An agent's instance key
-// proves possession of itself over the principal's bearer token AND authenticates the
-// delegation hops that agent signs; a capability holder secret signs the next capability
-// block AND the holder proofs that wield the capability. With nothing in the bytes saying
-// which is which, those are one signing oracle: a signature obtained for one purpose is
-// simply accepted for the other. A proof of possession over an attacker-chosen "principal
-// token" is then also a valid delegation hop granting whatever that token encoded.
+// proves possession of itself over a request binding AND authenticates the delegation hops
+// that agent signs; a capability holder secret signs the next capability block AND the holder
+// proofs that wield the capability. With nothing in the bytes saying which is which, those
+// are one signing oracle: a signature obtained for one purpose is simply accepted for the
+// other. A proof of possession over attacker-chosen bytes is then also a valid delegation hop
+// granting whatever those bytes encoded.
 //
 // So every signature commits to a context label naming what is being signed:
 //
@@ -32,9 +32,13 @@ import (
 // Context labels: one per distinct thing a key in this system signs. They must stay pairwise
 // distinct (TestContextsAreDistinct enforces it) — that is the entire security property.
 const (
-	// InstanceProof is an agent instance proving possession of its workload key over the
-	// principal bearer token it presents (workload.Proof / InstanceStage).
-	InstanceProof = "sanad/instance-proof/v1"
+	// InstanceProof is an agent instance proving possession of its workload key over a
+	// request-bound proof payload (workload.Proof / InstanceStage). v2: v1 signed the bare
+	// principal token, which is one deterministic value for the token's whole lifetime; v2
+	// signs the method, target, body hash, token hash, iat and jti of one request (internal/pop).
+	// The label moved so a captured v1 proof cannot be replayed against the new semantics —
+	// it now verifies under no context at all.
+	InstanceProof = "sanad/instance-proof/v2"
 
 	// WorkloadCredential is the authority CA's signature over an issued workload credential
 	// (workload.Authority.Issue / workload.Verify).
@@ -60,8 +64,9 @@ const (
 	CapabilityBlock = "sanad/capability-block/v1"
 
 	// CapabilityHolderProof is a capability holder proving possession of the final next-key
-	// (delegation.HolderProof / Capability.VerifyHolder).
-	CapabilityHolderProof = "sanad/capability-holder-proof/v1"
+	// (delegation.HolderProof / Capability.VerifyHolder). v2 for the same reason as
+	// InstanceProof: it is now a request-bound payload, not a signature over the bare token.
+	CapabilityHolderProof = "sanad/capability-holder-proof/v2"
 
 	// ExchangeToken is the exchange authority's signature over a centrally-issued delegation
 	// token (delegation.ExchangeAuthority).

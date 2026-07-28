@@ -82,7 +82,7 @@ client sets:
 | --- | --- |
 | `Authorization` | `Bearer <principal_token>` (you supply the opaque token) |
 | `X-Agent-Credential` | base64url(utf8(credential JSON text)) — encoded verbatim, never re-serialized |
-| `X-Agent-Proof` | base64url(Ed25519_sign(instance_priv, sigctx_message("sanad/instance-proof/v1", utf8(principal_token)))) |
+| `X-Agent-Proof` | `base64url(payload).base64url(Ed25519_sign(instance_priv, sigctx_message("sanad/instance-proof/v2", payload)))`, bound to this request — see `proof` below |
 | `X-Agent-Delegation` | base64url(utf8(delegation chain text)) — only if a delegation chain was provided |
 
 The credential's embedded signature would break if the JSON were re-serialized, so
@@ -92,7 +92,28 @@ the SDK encodes the **exact bytes** returned by enrollment.
 
 - `generate_instance_key() -> dict` — `{"private_key": base64url(seed||pub), "public_key": base64url(pub)}`.
 - `public_key_of(private_key: str) -> str` — accepts a 32-byte seed or 64-byte `seed||pub` (base64url).
-- `proof(private_key: str, principal_token: str) -> str`.
+- `proof(private_key, method, target, principal_token, body=None, iat=None, jti=None) -> str` —
+  the `X-Agent-Proof` value for **one request**. It is the DPoP construction (RFC 9449) in
+  Sanad's signature format: `base64url(payload) "." base64url(signature)`, where the payload
+  is compact JSON `{"ath","bh","htm","htu","iat","jti"}` — `ath` is
+  `base64url(sha256(principal_token))`, `bh` is `base64url(sha256(body))` (the hash of zero
+  bytes when there is none), and the signature is made under
+  `sanad/instance-proof/v2`. The gateway checks every claim against the request in front of
+  it, requires the proof to be seconds old, and spends the `jti` on first use. **Do not
+  cache it** — a proof that is the same bytes twice is a bearer token, and the second
+  request is rejected. Two departures from RFC 9449: the serialization is not a JWT (the key
+  already arrives in a CA-signed workload credential, and a parsed `alg` field is the root
+  of the JWT confusion family), and the body IS covered, which §11.7 explicitly does not do
+  — in MCP streamable HTTP every JSON-RPC message is POSTed to one endpoint, so method and
+  path are identical for `tools/list` and for a `tools/call` of any tool.
+- `capability_holder_proof(holder_secret, method, target, principal_token, body=None, ...) -> str` —
+  the `X-Agent-Capability-Proof` value: the same payload under
+  `sanad/capability-holder-proof/v2`.
+- `proof_target(url) -> str` — the `htu` value: the origin-form target (path plus query).
+  The authority is deliberately absent, because the gateway sits behind TLS terminators,
+  ingresses and the `passport proxy` sidecar, any of which can rewrite scheme or Host.
+- `proof_binding(...) -> dict` / `proof_payload(binding) -> bytes` — the claim set and its
+  canonical bytes, for callers that want to inspect or pin them.
 - `sigctx_message(ctx: str, message: bytes) -> bytes` — the domain-separated signing input
   Go's `sigctx.Message` produces: `uint64be(len(ctx)) || utf8(ctx) || message`. Every
   signature commits to a context label saying what it is, because the instance key signs
@@ -107,7 +128,9 @@ the SDK encodes the **exact bytes** returned by enrollment.
 - `request_nonce(authority_url) -> bytes` — the single-use enrollment challenge.
 - `enroll(authority_url, bootstrap_token, public_key) -> dict` — `{"credential": <raw text>, "agent_id", "not_after"}`.
 - `class PassportClient(gateway_url, instance_key, credential, delegation=None)`
-  - `.headers(principal_token) -> dict`
+  - `.headers(server_id, path, principal_token, method="GET", body=None) -> dict` — the
+    headers for **that request**; the proof is bound to its method, target and body.
+  - `.url(server_id, path) -> str`
   - `.request(server_id, path, principal_token, method="GET", body=None, headers=None) -> Response`
 - `Response(status: int, headers: dict, body: bytes)` with `.text()` and `.json()` helpers. A non-2xx
   gateway response is returned as a `Response` (with its status), not raised.

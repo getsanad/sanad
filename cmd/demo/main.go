@@ -157,22 +157,28 @@ func main() {
 	gw := httptest.NewServer(g)
 	defer gw.Close()
 
-	authorize := func(req *http.Request) {
+	// The proof is built per request: it commits to this request's method, target and body,
+	// so the header bundle from one call authenticates nothing else (workload.Proof).
+	authorize := func(req *http.Request, body []byte) {
+		proof, err := workload.Proof(a1Priv, req.Method, workload.ProofTarget(req.URL), bearer, body)
+		if err != nil {
+			panic(err)
+		}
 		req.Header.Set("Authorization", "Bearer "+bearer)
 		req.Header.Set(workload.HeaderCredential, credHdr)
-		req.Header.Set(workload.HeaderProof, workload.Proof(a1Priv, bearer))
+		req.Header.Set(workload.HeaderProof, proof)
 		req.Header.Set(delegation.HeaderDelegation, chainHdr)
 	}
 	send := func() (*http.Response, error) {
 		req, _ := http.NewRequest(http.MethodGet, gw.URL+"/servers/demo/tools/list", nil)
-		authorize(req)
+		authorize(req, nil)
 		return http.DefaultClient.Do(req)
 	}
 	// mcp POSTs a JSON-RPC message the way a real MCP client does, and returns status + body.
 	mcp := func(payload string) (int, string) {
 		req, _ := http.NewRequest(http.MethodPost, gw.URL+"/servers/demo/mcp", strings.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
-		authorize(req)
+		authorize(req, []byte(payload))
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return 0, err.Error()

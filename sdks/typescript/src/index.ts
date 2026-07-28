@@ -18,6 +18,13 @@
  *   - Every signature is domain-separated: it is made over
  *     `uint64be(ctx.length) || ctx || message`, where `ctx` names what is being signed
  *     (see `sigctxMessage`). Signing the bare message is NOT accepted by the gateway.
+ *   - The proof of possession is bound to ONE request. It is the DPoP construction
+ *     (RFC 9449) in Sanad's signature format: a payload naming the method (`htm`), the
+ *     target (`htu`), a hash of the principal token (`ath`), a hash of the body (`bh`),
+ *     a creation time (`iat`) and a unique id (`jti`), signed under the instance-proof
+ *     context. See `proof` for why the body is covered when DPoP leaves it out.
+ *     A proof therefore CANNOT be computed once and reused — that is the whole point,
+ *     and a client that caches one will be denied on its second request.
  *   - Enrolling is two requests: fetch a single-use nonce from the authority, then
  *     present attestation evidence covering both that nonce and the public key being
  *     enrolled. That binding is what stops an enrollment captured off the wire from
@@ -29,10 +36,12 @@
  */
 
 import {
+  createHash,
   createHmac,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
+  randomBytes,
   sign,
   type KeyObject,
 } from 'node:crypto';
@@ -75,8 +84,20 @@ function b64urlUtf8(s: string): string {
 /**
  * Context label for an instance proof of possession. Mirrors Go's
  * `sigctx.InstanceProof`.
+ *
+ * `v2` because the proof changed meaning: `v1` signed the bare principal token, `v2`
+ * signs a request binding. The label moved so a `v1` proof cannot be replayed against
+ * the new semantics — it now verifies under no context at all.
  */
-export const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v1';
+export const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v2';
+
+/**
+ * Context label for a capability holder proof (Go's `sigctx.CapabilityHolderProof`).
+ * The payload is the same shape as an instance proof; only the label differs, and that
+ * is what stops one from being presented as the other when both are signed by keys that
+ * can coincide.
+ */
+export const CTX_CAPABILITY_HOLDER_PROOF = 'sanad/capability-holder-proof/v2';
 
 /**
  * Build the domain-separated signing input Go's `sigctx.Message` produces:
@@ -165,20 +186,138 @@ export function publicKeyOf(privateKey: string): string {
   return b64url(rawPublicKey(priv));
 }
 
+// ---------------------------------------------------------------------------
+// Request-bound proof of possession (DPoP, RFC 9449)
+// ---------------------------------------------------------------------------
+
+/** base64url(SHA-256(data)) — the digest form both `ath` and `bh` use. */
+function sha256b64(data: Uint8Array | string): string {
+  const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
+  return b64url(createHash('sha256').update(buf).digest());
+}
+
 /**
- * Produce the proof of possession for a principal token: base64url of the Ed25519
- * signature, made with the instance private key, over the domain-separated signing
- * input for the token under `CTX_INSTANCE_PROOF`. Matches Go's `workload.Proof`.
- *
- * Signing the bare token — as this SDK did before the context was introduced — turns
- * the instance key into a signing oracle for anything else that key authenticates,
- * so the gateway rejects such a signature.
+ * The claims a proof commits to. Mirrors Go's `pop.Binding`; the key order here IS the
+ * canonical encoding order and must not be changed.
  */
-export function proof(privateKey: string, principalToken: string): string {
+export interface ProofBinding {
+  ath: string;
+  bh: string;
+  htm: string;
+  htu: string;
+  iat: number;
+  jti: string;
+}
+
+/** What a caller supplies to build a proof for one request. */
+export interface ProofInput {
+  /** HTTP method, exactly as it will be sent (e.g. `POST`). */
+  method: string;
+  /** Origin-form request target: path plus `?` and the query. No scheme or host — see `proofTarget`. */
+  target: string;
+  /** The principal bearer token this request carries. */
+  principalToken: string;
+  /** The request body bytes, if any. Omit for a request that carries none. */
+  body?: string | Uint8Array;
+  /** Creation time, Unix SECONDS. Defaults to now; set it only for tests and vectors. */
+  iat?: number;
+  /** Unique proof id. Defaults to 128 fresh random bits; set it only for tests and vectors. */
+  jti?: string;
+}
+
+/**
+ * The `htu` value for a URL: the origin-form request target the gateway will see, which
+ * is what both ends can compute identically. Mirrors Go's `pop.Target`.
+ *
+ * The authority is deliberately absent: the gateway sits behind TLS terminators, ingresses
+ * and the `passport proxy` sidecar, any of which can rewrite the scheme or the Host header,
+ * so binding a value the two ends compute differently buys an outage rather than security.
+ * The query IS included, where RFC 9449 drops it — nothing between an agent and the gateway
+ * rewrites query strings, and covering it is strictly stronger.
+ *
+ * Accepts an absolute URL or a bare path.
+ */
+export function proofTarget(url: string): string {
+  const u = new URL(url, 'http://sanad.invalid');
+  return (u.pathname || '/') + u.search;
+}
+
+/** Build the claim set for one request, filling in `iat` and `jti` when not supplied. */
+export function proofBinding(input: ProofInput): ProofBinding {
+  return {
+    ath: sha256b64(Buffer.from(input.principalToken, 'utf8')),
+    bh: sha256b64(input.body === undefined ? Buffer.alloc(0) : input.body),
+    htm: input.method,
+    htu: input.target,
+    iat: input.iat ?? Math.floor(Date.now() / 1000),
+    // 128 bits, above the 96 RFC 9449 §4.2 asks for.
+    jti: input.jti ?? b64url(randomBytes(16)),
+  };
+}
+
+/**
+ * The canonical payload bytes: compact JSON with the keys in `ProofBinding` order.
+ * `JSON.stringify` matches Go's `pop.Encode` (an encoder with HTML escaping off) and
+ * Python's `json.dumps(..., separators=(",", ":"), ensure_ascii=False)`.
+ */
+export function proofPayload(binding: ProofBinding): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      ath: binding.ath,
+      bh: binding.bh,
+      htm: binding.htm,
+      htu: binding.htu,
+      iat: binding.iat,
+      jti: binding.jti,
+    }),
+    'utf8',
+  );
+}
+
+/**
+ * Sign a request binding under an arbitrary context label, returning the header value
+ * `base64url(payload) "." base64url(signature)`. Mirrors Go's `pop.Sign`.
+ *
+ * The signature covers the payload bytes as transmitted, so the gateway never re-encodes
+ * what it is checking and the three SDK languages cannot disagree about JSON details.
+ */
+export function requestProof(ctx: string, privateKey: string, input: ProofInput): string {
   const priv = privateKeyObjectFromSeed(seedFromPrivateKey(privateKey));
-  const msg = sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from(principalToken, 'utf8'));
-  const sig = sign(null, msg, priv);
-  return b64url(sig);
+  const payload = proofPayload(proofBinding(input));
+  const sig = sign(null, sigctxMessage(ctx, payload), priv);
+  return `${b64url(payload)}.${b64url(sig)}`;
+}
+
+/**
+ * Produce the `X-Agent-Proof` value for one request. Matches Go's `workload.Proof`.
+ *
+ * The proof commits to the method, the target, a hash of the principal token (`ath`) and a
+ * hash of the body (`bh`), plus a creation time and a unique id. A gateway checks each
+ * against the request in front of it, requires the proof to be seconds old, and spends the
+ * `jti` on first use.
+ *
+ * Two departures from RFC 9449 are worth knowing about. The serialization is not a JWT:
+ * the key is already carried in a CA-signed workload credential, so DPoP's `jwk` header
+ * would be strictly weaker, and a parsed `alg` field is the root of the whole JWT confusion
+ * family. And the body IS covered, which RFC 9449 §11.7 explicitly does not do: in MCP
+ * streamable HTTP every JSON-RPC message is POSTed to one endpoint, so method and path are
+ * identical for `tools/list` and for a `tools/call` of any tool — a proof that stopped at
+ * the URL would leave a captured header bundle usable to invoke anything.
+ *
+ * Do NOT cache the result. Calling this once and reusing the value is precisely the bug
+ * this construction fixes, and the gateway will reject the second request.
+ */
+export function proof(privateKey: string, input: ProofInput): string {
+  return requestProof(CTX_INSTANCE_PROOF, privateKey, input);
+}
+
+/**
+ * Produce the `X-Agent-Capability-Proof` value for one request: the same binding as
+ * `proof`, signed under the capability holder context. Matches Go's
+ * `delegation.HolderProof`.
+ */
+export function capabilityHolderProof(holderSecret: string, input: ProofInput): string {
+  return requestProof(CTX_CAPABILITY_HOLDER_PROOF, holderSecret, input);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,12 +467,17 @@ export interface PassportClientOptions {
 }
 
 export interface RequestOptions {
-  /** Opaque principal bearer token; sent as `Authorization: Bearer <token>` and signed for the proof. */
+  /** Opaque principal bearer token; sent as `Authorization: Bearer <token>` and hashed into the proof. */
   principalToken: string;
   /** HTTP method (default GET). */
   method?: string;
-  /** Optional request body forwarded to the gateway. */
-  body?: RequestInit['body'];
+  /**
+   * Optional request body forwarded to the gateway. Narrowed to bytes the SDK can hash:
+   * the proof commits to a digest of the body, so a stream or a `FormData` — which cannot
+   * be read twice — could not be bound, and sending one unbound would leave the gateway
+   * authorizing bytes no proof covered.
+   */
+  body?: string | Uint8Array;
   /** Extra headers merged onto the injected passport headers (extras win on conflict). */
   headers?: Record<string, string>;
 }
@@ -361,15 +505,23 @@ export class PassportClient {
   }
 
   /**
-   * Build the passport headers for a given principal token: Authorization plus
-   * X-Agent-Credential and X-Agent-Proof, and X-Agent-Delegation only when a
-   * delegation chain was configured.
+   * Build the passport headers for ONE request: Authorization plus X-Agent-Credential and
+   * X-Agent-Proof, and X-Agent-Delegation only when a delegation chain was configured.
+   *
+   * It takes the request — server, path, method and body — because the proof is bound to
+   * all of them. The returned headers are good for that request and no other; building
+   * them once and reusing them across calls is the bug this construction exists to fix.
    */
-  headers(principalToken: string): Record<string, string> {
+  headers(serverId: string, path: string, opts: RequestOptions): Record<string, string> {
     const h: Record<string, string> = {
-      Authorization: `Bearer ${principalToken}`,
+      Authorization: `Bearer ${opts.principalToken}`,
       [HEADER_CREDENTIAL]: this.credentialHeader,
-      [HEADER_PROOF]: proof(this.instanceKey, principalToken),
+      [HEADER_PROOF]: proof(this.instanceKey, {
+        method: opts.method ?? 'GET',
+        target: proofTarget(this.url(serverId, path)),
+        principalToken: opts.principalToken,
+        body: opts.body,
+      }),
     };
     if (this.delegationHeader !== undefined) {
       h[HEADER_DELEGATION] = this.delegationHeader;
@@ -390,7 +542,7 @@ export class PassportClient {
   async request(serverId: string, path: string, opts: RequestOptions): Promise<Response> {
     const init: RequestInit = {
       method: opts.method ?? 'GET',
-      headers: { ...this.headers(opts.principalToken), ...(opts.headers ?? {}) },
+      headers: { ...this.headers(serverId, path, opts), ...(opts.headers ?? {}) },
     };
     if (opts.body !== undefined) init.body = opts.body;
     return this.fetchImpl(this.url(serverId, path), init);

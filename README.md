@@ -236,7 +236,9 @@ Postgres. Full walkthrough and the ECS/production shape: [`docs/DEPLOYMENT.md`](
 An agent reaches a protected server by calling the gateway with three things on the
 request: the **principal credential** (`Authorization: Bearer …`), its **workload
 credential** + proof (`X-Agent-Credential` / `X-Agent-Proof`), and its **delegation chain**
-(`X-Agent-Delegation`). The gateway authenticates, mints a passport, and forwards only that
+(`X-Agent-Delegation`). The proof is bound to that one request — method, target, body hash,
+token hash, a timestamp and a one-time id, the DPoP shape from RFC 9449 — so a captured
+header bundle authenticates nothing else and cannot be presented twice. The gateway authenticates, mints a passport, and forwards only that
 passport plus a minimal transport allowlist — every other inbound header (those credentials,
 cookies, API keys) is dropped, so a semi-trusted MCP server gets nothing it could replay
 (`PASSPORT_FORWARD_HEADERS` widens the allowlist). Once delegation is enabled a request with
@@ -251,7 +253,9 @@ the deployment sets `PASSPORT_ALLOW_DIRECT_PRINCIPAL=1` to let a principal act d
   passport proxy  --gateway   https://gw.example.com --key agent.key --credential cred.json \
                   --delegation chain.json   # agent now calls http://127.0.0.1:7070/servers/<id>/...
   ```
-- **Go agents:** use the `sdk` package (`sdk.New(gatewayURL, tokenSource).Call(...)`).
+- **Go agents:** use the `sdk` package (`sdk.New(gatewayURL, tokenSource).Call(...)`); add
+  `sdk.WithInstance(key, cred)` and `sdk.WithDelegation(chain)` to present a workload
+  identity, and the SDK builds a fresh proof for every call.
 - **TypeScript / Python agents:** use the client SDKs in [`sdks/`](sdks/) — same enroll →
   request flow as the sidecar, in-process (`npm i @getsanad/sdk` / `pip install sanad-sdk`).
 - **AI coding agents:** the [`skills/sanad`](skills/sanad/SKILL.md) skill

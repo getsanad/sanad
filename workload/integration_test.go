@@ -21,6 +21,18 @@ import (
 	"github.com/getsanad/sanad/workload"
 )
 
+// mustProof builds the instance proof for r. Proofs are bound to one request now — method,
+// target, body and principal token — so tests build one per request instead of reusing a
+// value; body must be the exact bytes the request carries.
+func mustProof(t *testing.T, key ed25519.PrivateKey, r *http.Request, token string, body []byte) string {
+	t.Helper()
+	p, err := workload.Proof(key, r.Method, workload.ProofTarget(r.URL), token, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func key(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -113,7 +125,7 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/servers/demo/tools/list", nil)
 	r.Header.Set("Authorization", "Bearer "+principalToken)
 	r.Header.Set(workload.HeaderCredential, credHdr)
-	r.Header.Set(workload.HeaderProof, workload.Proof(a2Priv, principalToken))
+	r.Header.Set(workload.HeaderProof, mustProof(t, a2Priv, r, principalToken, nil))
 	r.Header.Set(delegation.HeaderDelegation, chainHdr)
 
 	rec := httptest.NewRecorder()
@@ -229,7 +241,7 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 		r.Header.Set("Authorization", "Bearer "+principalToken)
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set(workload.HeaderCredential, credHdr)
-		r.Header.Set(workload.HeaderProof, workload.Proof(a2Priv, principalToken))
+		r.Header.Set(workload.HeaderProof, mustProof(t, a2Priv, r, principalToken, []byte(callBody(tool))))
 		r.Header.Set(delegation.HeaderDelegation, chainHdr)
 		rec := httptest.NewRecorder()
 		gatewayFor().ServeHTTP(rec, r)
@@ -292,7 +304,7 @@ func TestLiveInstanceWrongProofDenied(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer "+principalToken)
 	credHdr, _ := workload.EncodeCredential(cred)
 	r.Header.Set(workload.HeaderCredential, credHdr)
-	r.Header.Set(workload.HeaderProof, workload.Proof(attackerPriv, principalToken))
+	r.Header.Set(workload.HeaderProof, mustProof(t, attackerPriv, r, principalToken, nil))
 
 	req := &gateway.Request{HTTP: r, Principal: &types.Principal{ID: "p1"}}
 	if err := stage.Handle(context.Background(), req); err == nil {

@@ -141,7 +141,11 @@ func TestLivePipelineWithVCPrincipal(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer "+bearer)
 	credHdr, _ := workload.EncodeCredential(agentCred)
 	r.Header.Set(workload.HeaderCredential, credHdr)
-	r.Header.Set(workload.HeaderProof, workload.Proof(a1Priv, bearer))
+	proof, err := workload.Proof(a1Priv, r.Method, workload.ProofTarget(r.URL), bearer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set(workload.HeaderProof, proof)
 	r.Header.Set(delegation.HeaderDelegation, chainHdr)
 
 	rec := httptest.NewRecorder()

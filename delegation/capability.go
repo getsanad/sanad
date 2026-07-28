@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/internal/pop"
 	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
@@ -107,23 +109,61 @@ func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time) (Grant, err
 	return c.Blocks[len(c.Blocks)-1].Grant, nil
 }
 
-// HolderProof signs msg with the holder secret to prove possession of the capability.
+// HolderProof produces the proof that the presenter holds this capability, bound to ONE
+// request: method, target, a hash of the body, a hash of the principal bearer token, a
+// creation time and a unique id. It is the same construction as workload.Proof — DPoP
+// (RFC 9449) in Sanad's signature format — for the same reason.
+//
+// The reason applies here in full. A holder proof over the bare principal token is one fixed
+// value for that token's lifetime, so a captured X-Agent-Capability-Proof, paired with the
+// X-Agent-Capability sitting next to it in the same headers, let anyone wield the capability
+// — which is precisely the property VerifyHolder exists to deny (Capability's doc comment:
+// a recipient cannot broaden a capability because they lack the earlier next-secrets; that
+// argument is worth nothing if the proof they DO need is copyable off the wire).
 //
 // It is domain-separated from block signatures (sigctx.CapabilityHolderProof vs
 // CapabilityBlock) because the holder secret signs both: it proves possession here and signs
-// the next block in Attenuate. Untagged, proving possession over a caller-supplied msg is a
+// the next block in Attenuate. Untagged, proving possession over caller-supplied bytes is a
 // signing oracle for blocks — feed it the bytes of blockMsg and the proof comes back as a
-// valid attenuation, letting whoever chose msg re-point the capability at their own key.
-func HolderProof(holderSecret ed25519.PrivateKey, msg []byte) []byte {
-	return sigctx.Sign(sigctx.CapabilityHolderProof, holderSecret, msg)
+// valid attenuation, letting whoever chose the message re-point the capability at their own key.
+func HolderProof(holderSecret ed25519.PrivateKey, method, target, principalToken string, body []byte) (string, error) {
+	b, err := pop.NewBinding(method, target, principalToken, body, time.Now())
+	if err != nil {
+		return "", err
+	}
+	return pop.Sign(sigctx.CapabilityHolderProof, holderSecret, b)
 }
 
-// VerifyHolder checks a holder proof over msg against the capability's final next-key.
-func (c Capability) VerifyHolder(msg, proof []byte) bool {
+// ProofTarget is the htu value to sign for a request URL: the origin-form target the gateway
+// will see. It is the same string workload.ProofTarget returns — one definition, in
+// internal/pop — re-exported here so neither package has to import the other.
+func ProofTarget(u *url.URL) string { return pop.Target(u) }
+
+// HolderProofVerifier checks holder proofs: the signature, the request binding it commits to,
+// the freshness window, and the replay cache. It is an ALIAS of the shared implementation in
+// internal/pop, so the capability side and the instance side (workload.InstanceStage) cannot
+// drift into two different readings of the same wire format.
+type HolderProofVerifier = pop.Verifier
+
+// NewHolderProofVerifier returns the verifier CapabilityStage uses. Each one owns its replay
+// cache, which is per-process — see pop.ReplayCache.
+func NewHolderProofVerifier(opts ...StageOption) *HolderProofVerifier {
+	return pop.NewVerifier(sigctx.CapabilityHolderProof, newStageOptions(opts).proof...)
+}
+
+// VerifyHolder checks a holder proof against the capability's final next-key and the request
+// it arrived on. body is the buffered request body (nil when there is none) and token the
+// principal bearer token the proof must accompany. It returns an error rather than a bool
+// because "why" now has several answers — wrong key, wrong request, stale, replayed — and a
+// denial that cannot say which is not debuggable.
+func (c Capability) VerifyHolder(v *HolderProofVerifier, proof string, r *http.Request, body []byte, token string) error {
 	if len(c.Blocks) == 0 {
-		return false
+		return errors.New("delegation: empty capability")
 	}
-	return sigctx.Verify(sigctx.CapabilityHolderProof, c.Blocks[len(c.Blocks)-1].NextPub, msg, proof)
+	if v == nil {
+		return errors.New("delegation: no holder proof verifier")
+	}
+	return v.Check(c.Blocks[len(c.Blocks)-1].NextPub, proof, r, body, token)
 }
 
 // EncodeCapability serializes a capability for transport.
@@ -155,12 +195,12 @@ const (
 )
 
 // CapabilityStage is the offline delegation mode (FR-12b): an alternative to Stage. It
-// verifies a presented capability against rootPub and a holder proof over the principal's
-// bearer token, then narrows the request scope to the effective grant. Fails closed. A
-// request with no capability lets the principal act directly unless WithRequireChain is
-// set, which rejects it.
+// verifies a presented capability against rootPub and a holder proof bound to THIS request,
+// then narrows the request scope to the effective grant. Fails closed. A request with no
+// capability lets the principal act directly unless WithRequireChain is set, which rejects it.
 func CapabilityStage(rootPub ed25519.PublicKey, opts ...StageOption) gateway.Stage {
 	o := newStageOptions(opts)
+	verifier := pop.NewVerifier(sigctx.CapabilityHolderProof, o.proof...)
 	return gateway.NewStage("capability", func(_ context.Context, req *gateway.Request) error {
 		if req.Principal == nil {
 			return errors.New("delegation: no authenticated principal")
@@ -183,13 +223,18 @@ func CapabilityStage(rootPub ed25519.PublicKey, opts ...StageOption) gateway.Sta
 		if err != nil {
 			return err
 		}
-		token := bearer(req.HTTP)
-		proof, err := base64.RawURLEncoding.DecodeString(req.HTTP.Header.Get(HeaderCapabilityProof))
-		if err != nil {
-			return fmt.Errorf("delegation: bad capability proof: %w", err)
+		// Same rule as workload.InstanceStage: a body the gateway did not buffer is a body no
+		// proof committed to, and it is refused rather than authorized on a partial binding.
+		if req.Body == nil && req.HTTP.ContentLength != 0 && req.HTTP.Body != nil && req.HTTP.Body != http.NoBody {
+			return errors.New("delegation: request carries a body the capability holder proof cannot cover")
 		}
-		if token == "" || !c.VerifyHolder([]byte(token), proof) {
-			return errors.New("delegation: capability holder proof failed")
+		// Exactly one proof header, per RFC 9449 §4.3 step 1 — see workload.InstanceStage for
+		// why taking the first of several silently is a parser differential.
+		if n := len(req.HTTP.Header.Values(HeaderCapabilityProof)); n != 1 {
+			return fmt.Errorf("delegation: expected exactly one %s header, got %d", HeaderCapabilityProof, n)
+		}
+		if err := c.VerifyHolder(verifier, req.HTTP.Header.Get(HeaderCapabilityProof), req.HTTP, req.Body, bearer(req.HTTP)); err != nil {
+			return fmt.Errorf("delegation: capability holder proof failed: %w", err)
 		}
 		if err := checkServer(grant, req); err != nil {
 			return err // fail closed

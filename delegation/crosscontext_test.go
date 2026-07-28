@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/internal/pop"
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 	"github.com/getsanad/sanad/workload"
 )
@@ -78,15 +80,14 @@ func TestInstanceProofDoesNotForgeADelegationHop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The attack: choose the "principal token" to be the exact signing input of the hop the
-	// attacker wants, then ask the agent to prove possession of its instance key over it.
+	// The attack: get the agent's instance key to sign the exact bytes of the hop the attacker
+	// wants. workload.Proof no longer takes caller-chosen bytes at all — it only ever signs a
+	// request binding — so the oracle is modelled at the primitive, which is the strongest
+	// form of it: even a signature made under the instance-proof context over precisely the
+	// hop's canonical encoding must not verify as a hop.
 	forged := Hop{Delegator: agentID, Delegate: "EVIL", Grant: Grant{Tools: []string{"admin"}}}
-	token := string(canonical(forged.Delegator, forged.Delegate, forged.Grant, chain.Hops[0].Signature))
-	pop, err := base64.RawURLEncoding.DecodeString(workload.Proof(agentPriv, token))
-	if err != nil {
-		t.Fatal(err)
-	}
-	forged.Signature = pop
+	hopBytes := canonical(forged.Delegator, forged.Delegate, forged.Grant, chain.Hops[0].Signature)
+	forged.Signature = sigctx.Sign(sigctx.InstanceProof, agentPriv, hopBytes)
 
 	attack := Chain{Hops: append(append([]Hop(nil), chain.Hops...), forged)}
 	grant, agent, err := Verify(attack, store, principalID, time.Now())
@@ -134,28 +135,44 @@ func TestDelegationHopDoesNotForgeAnInstanceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The reverse direction: a hop this agent signed, replayed as the proof of possession
-	// for a principal token that happens to be the hop's signing input.
-	chain, err := NewRoot(priv, agentID, "sub-agent", Grant{Tools: []string{"read"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	token := string(canonical(agentID, "sub-agent", Grant{Tools: []string{"read"}}, nil))
-
+	// The reverse direction: a signature this agent made as a delegation hop, presented as
+	// the proof of possession for a request. The proof payload is well-formed and correct for
+	// the request in every way — only the context the signature was made under differs, which
+	// is exactly the property under test.
+	const token = "principal-bearer-token"
 	stage := workload.InstanceStage(caPub, workload.NewKeyStore(caPub))
-	handle := func(proof string) error {
+	handle := func(proofFor func(*http.Request) string) error {
 		r := httptest.NewRequest(http.MethodGet, "/servers/demo/x", nil)
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set(workload.HeaderCredential, credHdr)
-		r.Header.Set(workload.HeaderProof, proof)
+		r.Header.Set(workload.HeaderProof, proofFor(r))
 		req := &gateway.Request{HTTP: r, Principal: &types.Principal{ID: principalID}}
 		return stage.Handle(context.Background(), req)
 	}
 
-	if err := handle(base64.RawURLEncoding.EncodeToString(chain.Hops[0].Signature)); err == nil {
+	hopSigned := func(r *http.Request) string {
+		b, err := pop.NewBinding(r.Method, pop.Target(r.URL), token, nil, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr, err := pop.Sign(sigctx.DelegationHop, priv, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hdr
+	}
+	if err := handle(hopSigned); err == nil {
 		t.Fatal("a delegation hop signature was accepted as an instance proof of possession")
 	}
-	if err := handle(workload.Proof(priv, token)); err != nil {
+
+	honest := func(r *http.Request) string {
+		p, err := workload.Proof(priv, r.Method, workload.ProofTarget(r.URL), token, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if err := handle(honest); err != nil {
 		t.Fatalf("a real proof of possession must still be accepted: %v", err)
 	}
 }
@@ -179,8 +196,11 @@ func TestHolderProofDoesNotForgeACapabilityBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// HolderProof no longer signs caller-chosen bytes — it only ever signs a request binding —
+	// so the oracle is modelled at the primitive: a signature made under the holder-proof
+	// context over precisely the block's signing input must still not verify as a block.
 	stolenGrant := Grant{Tools: []string{"read"}}
-	proof := HolderProof(holderSecret, blockMsg(stolenGrant, attackerPub))
+	proof := sigctx.Sign(sigctx.CapabilityHolderProof, holderSecret, blockMsg(stolenGrant, attackerPub))
 
 	stolen := Capability{Blocks: append(append([]Block(nil), cap.Blocks...),
 		Block{Grant: stolenGrant, NextPub: attackerPub, Signature: proof})}
@@ -209,14 +229,18 @@ func TestCapabilityBlockSignatureDoesNotForgeAHolderProof(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The block signature the holder made, replayed as a proof of possession over the bytes
-	// it covers. Verified against cap's final next-key, which is the key that signed it.
-	msg := blockMsg(att.Blocks[1].Grant, att.Blocks[1].NextPub)
-	if cap.VerifyHolder(msg, att.Blocks[1].Signature) {
+	// The block signature the holder made, pasted into an otherwise perfectly correct proof
+	// for this request. Verified against cap's final next-key, which is the key that signed
+	// it, so only the context stands between the attacker and a valid holder proof.
+	r, body := capHTTP()
+	payload := capPayload(t, r, body)
+	forged := base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(att.Blocks[1].Signature)
+	if err := cap.VerifyHolder(holderVerifier(), forged, r, body, capTestToken); err == nil {
 		t.Fatal("a capability block signature was accepted as a holder proof")
 	}
-	if !cap.VerifyHolder(msg, HolderProof(holderSecret, msg)) {
-		t.Fatal("a real holder proof must still verify")
+	if err := cap.VerifyHolder(holderVerifier(), capProof(t, holderSecret, r, body), r, body, capTestToken); err != nil {
+		t.Fatalf("a real holder proof must still verify: %v", err)
 	}
 }
 
@@ -228,7 +252,6 @@ func TestCapabilityBlockSignatureDoesNotForgeAHolderProof(t *testing.T) {
 
 func TestInstanceProofDoesNotForgeACapabilityHolderProof(t *testing.T) {
 	rootPub, rootPriv := rootKeys(t)
-	const token = "principal-token"
 
 	// The holder secret and the instance key are the same key.
 	cap, holderSecret, err := NewCapability(rootPriv, Grant{Tools: []string{"read"}})
@@ -241,20 +264,27 @@ func TestInstanceProofDoesNotForgeACapabilityHolderProof(t *testing.T) {
 	}
 
 	stage := CapabilityStage(rootPub)
-	handle := func(proof string) error {
-		r := httptest.NewRequest(http.MethodGet, "/servers/demo/x", nil)
-		r.Header.Set("Authorization", "Bearer "+token)
+	handle := func(proofFor func(*http.Request) string) error {
+		r, _ := capHTTP()
 		r.Header.Set(HeaderCapability, capHdr)
-		r.Header.Set(HeaderCapabilityProof, proof)
+		r.Header.Set(HeaderCapabilityProof, proofFor(r))
 		req := &gateway.Request{HTTP: r, Principal: &types.Principal{ID: "p1"}}
 		return stage.Handle(context.Background(), req)
 	}
 
-	if err := handle(workload.Proof(holderSecret, token)); err == nil {
+	// The instance proof this agent makes for the very same request: identical payload,
+	// different context. That is the whole difference, and it has to be enough.
+	asInstance := func(r *http.Request) string {
+		p, err := workload.Proof(holderSecret, r.Method, workload.ProofTarget(r.URL), capTestToken, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if err := handle(asInstance); err == nil {
 		t.Fatal("an instance proof of possession was accepted as a capability holder proof")
 	}
-	proof := base64.RawURLEncoding.EncodeToString(HolderProof(holderSecret, []byte(token)))
-	if err := handle(proof); err != nil {
+	if err := handle(func(r *http.Request) string { return capProof(t, holderSecret, r, nil) }); err != nil {
 		t.Fatalf("a real capability holder proof must still be accepted: %v", err)
 	}
 }

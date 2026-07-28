@@ -16,8 +16,13 @@ import {
   generateInstanceKey,
   publicKeyOf,
   proof,
+  proofBinding,
+  proofPayload,
+  proofTarget,
+  capabilityHolderProof,
   sigctxMessage,
   CTX_INSTANCE_PROOF,
+  CTX_CAPABILITY_HOLDER_PROOF,
   bootstrapEvidence,
   requestNonce,
   enroll,
@@ -33,9 +38,36 @@ const SEED_B64URL = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA';
 const FULL_B64URL =
   'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA';
 const EXPECTED_PUB = 'ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ';
-// The proof is over the domain-separated signing input, not the bare token.
+// The request one instance proof is bound to. A proof is per-request now, so the vector
+// pins the request too, and holds fixed the two inputs a real proof randomizes (iat, jti).
+const TOKEN = 'test-principal-token';
+const METHOD = 'POST';
+const TARGET = '/servers/demo/mcp';
+const BODY = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}';
+const IAT = 1767225600; // 2026-01-01T00:00:00Z
+const JTI = 'AAECAwQFBgcICQoLDA0ODw';
+
+const EXPECTED_ATH = 'eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI';
+const EXPECTED_BH = 'qXDbbSbAIAqtTp_paFTD5GK3FpDPUyMfdw3M-BeWpWw';
+const EXPECTED_BH_EMPTY = '47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU';
+const EXPECTED_PAYLOAD =
+  '{"ath":"eaVdc24MF5rbKpTXWDI5W-tXHNfA1-qvFjwQ4GIhjlI","bh":"qXDbbSbAIAqtTp_paFTD5GK3FpDPUyMfdw3M-BeWpWw","htm":"POST","htu":"/servers/demo/mcp","iat":1767225600,"jti":"AAECAwQFBgcICQoLDA0ODw"}';
+// base64url(payload) "." base64url(signature).
 const EXPECTED_PROOF =
-  '_xyI6J0jruF9VJx5RZimoWtBtrH_7lFTueCgCdeSllnwDcTP5bxCQ9ponOj9OZSbidfO-89TiuC8QYwKBYmlDw';
+  'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.xDlJ_BHqkqNCj1L4e4RqJsHSO_DE71uRiqALR6CRFdMSC-ICPY8rojK3uyy_coSbhDFQBT1mpL0ECFk8sIlpBw';
+// The same payload signed under the capability holder context.
+const EXPECTED_HOLDER_PROOF =
+  'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw';
+
+/** The vector's proof input, with iat and jti pinned. */
+const VECTOR_INPUT = {
+  method: METHOD,
+  target: TARGET,
+  principalToken: TOKEN,
+  body: BODY,
+  iat: IAT,
+  jti: JTI,
+};
 
 // Enrollment nonce 0x00..0x1f, and the bootstrap evidence Go's workload.BootstrapEvidence
 // produces for it with token "boot-token" and EXPECTED_PUB.
@@ -55,8 +87,57 @@ test('publicKeyOf matches the fixed vector', () => {
   assert.equal(publicKeyOf(SEED_B64URL), EXPECTED_PUB);
 });
 
+test('the derived claim values match the fixed vectors', () => {
+  const b = proofBinding(VECTOR_INPUT);
+  assert.equal(b.ath, EXPECTED_ATH);
+  assert.equal(b.bh, EXPECTED_BH);
+  // A request with no body still commits to one: the hash of zero bytes.
+  assert.equal(proofBinding({ ...VECTOR_INPUT, body: undefined }).bh, EXPECTED_BH_EMPTY);
+});
+
+test('the canonical payload encoding matches the fixed vector', () => {
+  const payload = proofPayload(proofBinding(VECTOR_INPUT)).toString('utf8');
+  assert.equal(payload, EXPECTED_PAYLOAD);
+});
+
 test('proof matches the fixed vector', () => {
-  assert.equal(proof(SEED_B64URL, 'test-principal-token'), EXPECTED_PROOF);
+  assert.equal(proof(SEED_B64URL, VECTOR_INPUT), EXPECTED_PROOF);
+});
+
+test('capabilityHolderProof is the same payload under a different context', () => {
+  const holder = capabilityHolderProof(SEED_B64URL, VECTOR_INPUT);
+  assert.equal(holder, EXPECTED_HOLDER_PROOF);
+  // Same payload, different signature: an instance proof must not pass as a holder proof.
+  assert.equal(holder.split('.')[0], EXPECTED_PROOF.split('.')[0]);
+  assert.notEqual(holder.split('.')[1], EXPECTED_PROOF.split('.')[1]);
+});
+
+test('proofTarget yields the origin-form target both ends compare', () => {
+  assert.equal(proofTarget('https://gw.example.com/servers/demo/mcp'), '/servers/demo/mcp');
+  assert.equal(proofTarget('/servers/demo/mcp?cursor=abc'), '/servers/demo/mcp?cursor=abc');
+  // Percent-encoding is preserved, not decoded into a real separator.
+  assert.equal(proofTarget('/servers/demo/a%2Fb'), '/servers/demo/a%2Fb');
+});
+
+test('a proof is bound to its request: changing any covered input changes it', () => {
+  const base = proof(SEED_B64URL, VECTOR_INPUT);
+  for (const changed of [
+    { ...VECTOR_INPUT, method: 'GET' },
+    { ...VECTOR_INPUT, target: '/servers/other/mcp' },
+    { ...VECTOR_INPUT, target: TARGET + '?x=1' },
+    { ...VECTOR_INPUT, principalToken: 'another-token' },
+    { ...VECTOR_INPUT, body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' },
+    { ...VECTOR_INPUT, body: undefined },
+    { ...VECTOR_INPUT, iat: IAT + 1 },
+    { ...VECTOR_INPUT, jti: 'a-different-jti' },
+  ]) {
+    assert.notEqual(proof(SEED_B64URL, changed), base);
+  }
+});
+
+test('two proofs for the identical request differ: a repeatable proof is a bearer token', () => {
+  const input = { method: METHOD, target: TARGET, principalToken: TOKEN, body: BODY };
+  assert.notEqual(proof(SEED_B64URL, input), proof(SEED_B64URL, input));
 });
 
 test('sigctxMessage produces the length-prefixed layout Go signs', () => {
@@ -69,28 +150,31 @@ test('sigctxMessage produces the length-prefixed layout Go signs', () => {
   );
 });
 
-test('proof signs the domain-separated input, not the bare token', () => {
+test('proof signs the domain-separated payload, not the bare token', () => {
   const PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex');
   const priv = createPrivateKey({
     key: Buffer.concat([PKCS8, Buffer.from(SEED_B64URL, 'base64url')]),
     format: 'der',
     type: 'pkcs8',
   });
-  const token = 'test-principal-token';
 
-  // The pre-domain-separation form: a raw signature over the token bytes. It must NOT be
-  // what the SDK sends — the gateway rejects it, because that signature would equally be
-  // a delegation hop signed by the same instance key.
-  const bare = edSign(null, Buffer.from(token, 'utf8'), priv).toString('base64url');
-  assert.notEqual(proof(SEED_B64URL, token), bare);
+  // The pre-binding form: a signature over the token bytes. Ed25519 is deterministic, so
+  // that value was identical on every request for the token's lifetime — a bearer token
+  // with extra steps. It must NOT be what the SDK sends, and the gateway rejects it.
+  const bare = edSign(null, Buffer.from(TOKEN, 'utf8'), priv).toString('base64url');
+  assert.notEqual(proof(SEED_B64URL, VECTOR_INPUT), bare);
 
-  // And the proof is exactly a signature over sigctxMessage(CTX_INSTANCE_PROOF, token).
-  const tagged = edSign(
-    null,
-    sigctxMessage(CTX_INSTANCE_PROOF, Buffer.from(token, 'utf8')),
-    priv,
-  ).toString('base64url');
-  assert.equal(proof(SEED_B64URL, token), tagged);
+  // The proof is exactly base64url(payload) "." base64url(sign(sigctxMessage(ctx, payload))).
+  const payload = proofPayload(proofBinding(VECTOR_INPUT));
+  const tagged = edSign(null, sigctxMessage(CTX_INSTANCE_PROOF, payload), priv);
+  assert.equal(
+    proof(SEED_B64URL, VECTOR_INPUT),
+    `${payload.toString('base64url')}.${tagged.toString('base64url')}`,
+  );
+
+  // And the holder-proof context produces a different signature over those same bytes.
+  const holder = edSign(null, sigctxMessage(CTX_CAPABILITY_HOLDER_PROOF, payload), priv);
+  assert.notEqual(holder.toString('base64url'), tagged.toString('base64url'));
 });
 
 test('base64url(utf8(credential)) matches the fixed vector', () => {
@@ -100,10 +184,7 @@ test('base64url(utf8(credential)) matches the fixed vector', () => {
 test('64-byte private input and its 32-byte seed prefix agree', () => {
   assert.equal(publicKeyOf(FULL_B64URL), EXPECTED_PUB);
   assert.equal(publicKeyOf(FULL_B64URL), publicKeyOf(SEED_B64URL));
-  assert.equal(
-    proof(FULL_B64URL, 'test-principal-token'),
-    proof(SEED_B64URL, 'test-principal-token'),
-  );
+  assert.equal(proof(FULL_B64URL, VECTOR_INPUT), proof(SEED_B64URL, VECTOR_INPUT));
 });
 
 test('the 64-byte form of the seed key equals the fixed vector', () => {
@@ -122,10 +203,11 @@ test('generate -> publicKeyOf round-trips', () => {
   assert.equal(raw.length, 64);
   // Its trailing 32 bytes are exactly the public key.
   assert.equal(raw.subarray(32).toString('base64url'), key.publicKey);
-  // A signature made with this key is verifiable via a proof round-trip: the proof
-  // for a token is deterministic for Ed25519, so it must be stable.
-  const p1 = proof(key.privateKey, 'hello');
-  const p2 = proof(raw.subarray(0, 32).toString('base64url'), 'hello');
+  // The seed and the 64-byte form must produce the same proof for the same fixed binding
+  // (fixed, because a real proof randomizes its jti).
+  const input = { ...VECTOR_INPUT, target: '/servers/demo/tools/list' };
+  const p1 = proof(key.privateKey, input);
+  const p2 = proof(raw.subarray(0, 32).toString('base64url'), input);
   assert.equal(p1, p2);
 });
 
@@ -135,10 +217,20 @@ test('PassportClient.headers builds the 3 base headers (no delegation)', () => {
     instanceKey: SEED_B64URL,
     credential: CRED_TEXT,
   });
-  const h = client.headers('test-principal-token');
-  assert.equal(h['Authorization'], 'Bearer test-principal-token');
+  const h = client.headers('demo', '/mcp', {
+    principalToken: TOKEN,
+    method: METHOD,
+    body: BODY,
+  });
+  assert.equal(h['Authorization'], `Bearer ${TOKEN}`);
   assert.equal(h[HEADER_CREDENTIAL], EXPECTED_CRED_HEADER);
-  assert.equal(h[HEADER_PROOF], EXPECTED_PROOF);
+  // The proof is fresh per call, so the vector cannot be compared byte-for-byte; what is
+  // pinned is that it is bound to THIS request.
+  const payload = JSON.parse(Buffer.from(h[HEADER_PROOF]!.split('.')[0]!, 'base64url').toString());
+  assert.equal(payload.htm, METHOD);
+  assert.equal(payload.htu, '/servers/demo/mcp');
+  assert.equal(payload.ath, EXPECTED_ATH);
+  assert.equal(payload.bh, EXPECTED_BH);
   assert.equal(h[HEADER_DELEGATION], undefined);
   assert.equal(Object.prototype.hasOwnProperty.call(h, HEADER_DELEGATION), false);
 });
@@ -151,7 +243,7 @@ test('PassportClient.headers includes X-Agent-Delegation when configured', () =>
     credential: CRED_TEXT,
     delegation: chain,
   });
-  const h = client.headers('test-principal-token');
+  const h = client.headers('demo', '/mcp', { principalToken: TOKEN });
   assert.equal(h[HEADER_DELEGATION], b64urlUtf8(chain));
 });
 
@@ -182,7 +274,7 @@ test('PassportClient.request injects headers, method, body and forwards to the g
   });
 
   const resp = await client.request('demo', '/tools/call', {
-    principalToken: 'test-principal-token',
+    principalToken: TOKEN,
     method: 'POST',
     body: '{"name":"echo"}',
     headers: { 'Content-Type': 'application/json' },
@@ -195,10 +287,21 @@ test('PassportClient.request injects headers, method, body and forwards to the g
   assert.equal(call.init.method, 'POST');
   assert.equal(call.init.body, '{"name":"echo"}');
   const headers = call.init.headers as Record<string, string>;
-  assert.equal(headers['Authorization'], 'Bearer test-principal-token');
+  assert.equal(headers['Authorization'], `Bearer ${TOKEN}`);
   assert.equal(headers[HEADER_CREDENTIAL], EXPECTED_CRED_HEADER);
-  assert.equal(headers[HEADER_PROOF], EXPECTED_PROOF);
   assert.equal(headers['Content-Type'], 'application/json');
+  // The injected proof is bound to the request actually being sent — method, target and
+  // the body the gateway will hash — not to a value computed once at construction.
+  const sent = JSON.parse(
+    Buffer.from(headers[HEADER_PROOF]!.split('.')[0]!, 'base64url').toString(),
+  );
+  assert.equal(sent.htm, 'POST');
+  assert.equal(sent.htu, '/servers/demo/tools/call');
+  assert.equal(sent.ath, EXPECTED_ATH);
+  assert.equal(
+    sent.bh,
+    proofBinding({ ...VECTOR_INPUT, body: '{"name":"echo"}' }).bh,
+  );
 });
 
 test('bootstrapEvidence matches the fixed Go vector', () => {

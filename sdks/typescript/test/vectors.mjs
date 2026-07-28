@@ -41,6 +41,7 @@ function sigctxMessage(ctx, message) {
 }
 const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v2';
 const CTX_CAPABILITY_HOLDER_PROOF = 'sanad/capability-holder-proof/v2';
+const CTX_VC_HOLDER_PROOF = 'sanad/vc-holder-proof/v1';
 
 function sha256b64(data) {
   return crypto.createHash('sha256').update(Buffer.from(data)).digest().toString('base64url');
@@ -108,6 +109,8 @@ const PROOF =
   'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.xDlJ_BHqkqNCj1L4e4RqJsHSO_DE71uRiqALR6CRFdMSC-ICPY8rojK3uyy_coSbhDFQBT1mpL0ECFk8sIlpBw';
 const HOLDER_PROOF =
   'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw';
+const PRINCIPAL_PROOF =
+  'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.8TeIZgdZx6nsllD1fkMtIAD6WtXItJlK2C_D2-dOttLSHxPTH-HdKuVKEB6trOaoMHSfbadX2xyr6zjIcj6MBQ';
 // The signing input the proof covers, as hex: 8-byte length || context || payload.
 const PROOF_INPUT_HEX = '000000000000001773616e61642f696e7374616e63652d70726f6f662f76327b22617468223a22656156646332344d463572624b70545857444935572d7458484e6641312d7176466a7751344749686a6c49222c226268223a2271584462625362414941717454705f706146544435474b334670445055794d666477334d2d426557705777222c2268746d223a22504f5354222c22687475223a222f736572766572732f64656d6f2f6d6370222c22696174223a313736373232353630302c226a7469223a2241414543417751464267634943516f4c4441304f4477227d';
 const CRED = '{"AgentID":"agent-1","PublicKey":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","IssuedAt":"2026-07-10T00:00:00Z","NotAfter":"2026-07-10T01:00:00Z","KeyID":"ca-1","Signature":"AA=="}';
@@ -129,6 +132,7 @@ const results = [
   ['proof(seed, request)', proof(SEED, VECTOR_INPUT), PROOF],
   ['proof(64-byte form) == proof(seed)', proof(FULL, VECTOR_INPUT), PROOF],
   ['capability holder proof over the same payload', requestProof(CTX_CAPABILITY_HOLDER_PROOF, SEED, VECTOR_INPUT), HOLDER_PROOF],
+  ['principal (VC) holder proof over the same payload', requestProof(CTX_VC_HOLDER_PROOF, SEED, VECTOR_INPUT), PRINCIPAL_PROOF],
   ['base64url(utf8(credential))', Buffer.from(CRED, 'utf8').toString('base64url'), CRED_HEADER],
   ['bootstrapEvidence("boot-token", nonce, pub)', bootstrapEvidence('boot-token', Buffer.from(NONCE, 'base64url'), Buffer.from(PUB, 'base64url')).toString('base64url'), EVIDENCE],
 ];

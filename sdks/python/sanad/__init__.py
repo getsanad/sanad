@@ -21,6 +21,11 @@ a hash of the principal token (``ath``), a hash of the body (``bh``), a creation
 cannot be computed once and reused — that is the point, and a client that caches one is
 denied on its second request.
 
+A gateway in VC mode expects TWO proofs on each request: one from the agent instance
+(``X-Agent-Proof``) and one from the principal whose credential is being presented
+(``X-Principal-Proof``). A principal credential is not a bearer token — see
+:func:`principal_holder_proof` and the ``principal_key`` client argument.
+
 Enrolling is two requests: the agent fetches a single-use nonce from the authority,
 then presents attestation evidence that covers both that nonce and the public key it
 is enrolling. That binding is what stops an enrollment captured off the wire from
@@ -59,6 +64,7 @@ __all__ = [
     "public_key_of",
     "proof",
     "capability_holder_proof",
+    "principal_holder_proof",
     "request_proof",
     "proof_binding",
     "proof_payload",
@@ -66,6 +72,7 @@ __all__ = [
     "sigctx_message",
     "CTX_INSTANCE_PROOF",
     "CTX_CAPABILITY_HOLDER_PROOF",
+    "CTX_VC_HOLDER_PROOF",
     "bootstrap_evidence",
     "request_nonce",
     "enroll",
@@ -76,12 +83,14 @@ __all__ = [
     "HEADER_CREDENTIAL",
     "HEADER_PROOF",
     "HEADER_DELEGATION",
+    "HEADER_PRINCIPAL_PROOF",
 ]
 
 # Header names must match the Go constants exactly.
-HEADER_CREDENTIAL = "X-Agent-Credential"  # workload/workload.go: HeaderCredential
-HEADER_PROOF = "X-Agent-Proof"            # workload/workload.go: HeaderProof
-HEADER_DELEGATION = "X-Agent-Delegation"  # delegation/transport.go: HeaderDelegation
+HEADER_CREDENTIAL = "X-Agent-Credential"        # workload/workload.go: HeaderCredential
+HEADER_PROOF = "X-Agent-Proof"                  # workload/workload.go: HeaderProof
+HEADER_DELEGATION = "X-Agent-Delegation"        # delegation/transport.go: HeaderDelegation
+HEADER_PRINCIPAL_PROOF = "X-Principal-Proof"    # vc/holder.go: HeaderPrincipalProof
 
 _SEED_SIZE = 32
 _PUB_SIZE = 32
@@ -98,6 +107,13 @@ CTX_INSTANCE_PROOF = "sanad/instance-proof/v2"
 # payload is the same shape as an instance proof; only the label differs, and that is what
 # stops one from being presented as the other when both are signed by keys that can coincide.
 CTX_CAPABILITY_HOLDER_PROOF = "sanad/capability-holder-proof/v2"
+
+# Context label for a principal holder proof (Go's ``sigctx.VCHolderProof``): the presenter of
+# a W3C-style principal credential proving possession of the credential subject's ``did:key``
+# private key. Again the same payload shape, and again the label is the only thing keeping one
+# kind of signature from being read as another — a principal's ``did:key`` also signs
+# delegation hops and, if it is an issuer, credentials.
+CTX_VC_HOLDER_PROOF = "sanad/vc-holder-proof/v1"
 
 
 class PassportError(Exception):
@@ -337,6 +353,33 @@ def capability_holder_proof(
     )
 
 
+def principal_holder_proof(
+    principal_key: str,
+    method: str,
+    target: str,
+    principal_token: str,
+    body: Optional[Union[bytes, str]] = None,
+    iat: Optional[int] = None,
+    jti: Optional[str] = None,
+) -> str:
+    """Produce the ``X-Principal-Proof`` value for one request. Mirrors Go's ``vc.HolderProof``.
+
+    A gateway in VC mode (``PASSPORT_PRINCIPAL_MODE=vc``) does not treat the principal
+    credential as a bearer token: the credential proves that a trusted issuer vouched for a
+    ``did:key``, and this proves that the caller actually holds that key, on this request.
+    Both are required. Without it the credential would be exactly as good as a copy of it,
+    which is what anything that sees one request's headers gets for free.
+
+    :param principal_key: base64url ``did:key`` private key of the credential SUBJECT — not
+        the instance key, and not the issuer's key.
+    :param principal_token: the credential string exactly as sent in the Authorization
+        header, since the proof commits to it (``ath``).
+    """
+    return request_proof(
+        CTX_VC_HOLDER_PROOF, principal_key, method, target, principal_token, body, iat, jti
+    )
+
+
 # --- Enrollment -----------------------------------------------------------------
 
 def bootstrap_evidence(bootstrap_token: str, nonce: bytes, public_key: bytes) -> bytes:
@@ -487,14 +530,19 @@ class PassportClient:
     """Attaches Sanad headers and forwards MCP requests to the gateway.
 
     This mirrors the ``passport proxy`` sidecar: it injects the principal token,
-    the workload credential, a proof of possession, and (optionally) a delegation
-    chain onto every request.
+    the workload credential, a proof of possession of the instance key, a proof of
+    possession of the principal's ``did:key`` when one is configured, and (optionally)
+    a delegation chain onto every request.
 
     :param gateway_url: base URL of the gateway.
     :param instance_key: base64url private key (seed or seed||pub), or the dict from
         :func:`generate_instance_key`.
     :param credential: the raw credential JSON text, or the dict from :func:`enroll`.
     :param delegation: optional delegation chain JSON text (a string), or ``None``.
+    :param principal_key: the principal's base64url ``did:key`` private key. Required by
+        gateways in VC mode, where the principal credential is not a bearer token and each
+        request carries a proof of possession of this key (see
+        :func:`principal_holder_proof`). Omit it in OIDC mode, where there is no such key.
     """
 
     def __init__(
@@ -503,13 +551,17 @@ class PassportClient:
         instance_key: Union[str, Dict[str, Any]],
         credential: Union[str, Dict[str, Any]],
         delegation: Optional[str] = None,
+        principal_key: Optional[str] = None,
     ):
         self.gateway_url = gateway_url.rstrip("/")
         self._private_key = _instance_key_str(instance_key)
-        # Validate the key early.
+        # Validate the keys early.
         _load_private(self._private_key)
         self._credential_text = _credential_text(credential)
         self._delegation = delegation
+        self._principal_key = principal_key
+        if principal_key is not None:
+            _load_private(principal_key)
 
     def url(self, server_id: str, path: str) -> str:
         """Build the full gateway URL: ``{gateway_url}/servers/{server_id}{path}``."""
@@ -529,17 +581,16 @@ class PassportClient:
         all of them. The returned headers are good for that request and no other; building
         them once and reusing them across calls is the bug this construction exists to fix.
         """
+        target = proof_target(self.url(server_id, path))
         h = {
             "Authorization": "Bearer " + principal_token,
             HEADER_CREDENTIAL: _b64url_encode(self._credential_text.encode("utf-8")),
-            HEADER_PROOF: proof(
-                self._private_key,
-                method,
-                proof_target(self.url(server_id, path)),
-                principal_token,
-                body,
-            ),
+            HEADER_PROOF: proof(self._private_key, method, target, principal_token, body),
         }
+        if self._principal_key is not None:
+            h[HEADER_PRINCIPAL_PROOF] = principal_holder_proof(
+                self._principal_key, method, target, principal_token, body
+            )
         if self._delegation is not None:
             h[HEADER_DELEGATION] = _b64url_encode(self._delegation.encode("utf-8"))
         return h

@@ -6,8 +6,9 @@
 //
 // `proxy` runs a local sidecar: point your agent's MCP client at it (e.g.
 // http://127.0.0.1:7070/servers/<id>/...) and it injects the principal token, the workload
-// credential + proof of possession, and an optional delegation chain, then forwards to the
-// gateway. The agent never has to build any of those headers itself.
+// credential + proof of possession, a principal holder proof when a principal key is
+// configured (--principal-key, required by gateways in VC mode), and an optional delegation
+// chain, then forwards to the gateway. The agent never has to build any of those headers.
 package main
 
 import (
@@ -29,6 +30,7 @@ import (
 
 	"github.com/getsanad/sanad/delegation"
 	"github.com/getsanad/sanad/internal/mcprpc"
+	"github.com/getsanad/sanad/vc"
 	"github.com/getsanad/sanad/workload"
 )
 
@@ -68,6 +70,10 @@ Usage:
       --listen ADDR       local address (default 127.0.0.1:7070)
       --token-env VAR     env var with the principal bearer token (default PASSPORT_PRINCIPAL_TOKEN)
       --token-file FILE   file with the principal bearer token (overrides --token-env)
+      --principal-key FILE  the principal's did:key private key. REQUIRED by gateways in
+                          VC mode (PASSPORT_PRINCIPAL_MODE=vc): the credential is not a
+                          bearer token, so each request carries a proof of possession of
+                          this key. Omit it in OIDC mode, where there is no such key.
       --delegation FILE   delegation chain JSON (gateways with delegation enabled
                           require one unless PASSPORT_ALLOW_DIRECT_PRINCIPAL=1)
       --max-body BYTES    request body buffered to bind the proof (default 1 MiB;
@@ -153,6 +159,7 @@ func runProxy(args []string) {
 	credFile := fs.String("credential", "", "workload credential JSON file (required)")
 	tokenEnv := fs.String("token-env", "PASSPORT_PRINCIPAL_TOKEN", "env var holding the principal bearer token")
 	tokenFile := fs.String("token-file", "", "file holding the principal bearer token (overrides --token-env)")
+	principalKeyFile := fs.String("principal-key", "", "the principal's did:key private key file (required by gateways in VC mode)")
 	delegationFile := fs.String("delegation", "", "delegation chain JSON file (required by gateways with delegation enabled)")
 	maxBody := fs.Int64("max-body", 0, "bytes of request body buffered to bind the proof (0 = 1 MiB; must be >= the gateway's PASSPORT_MAX_REQUEST_BODY)")
 	_ = fs.Parse(args)
@@ -162,13 +169,19 @@ func runProxy(args []string) {
 		os.Exit(2)
 	}
 
-	key, err := loadInstanceKey(*keyFile)
+	key, err := loadPrivateKey(*keyFile)
 	if err != nil {
 		log.Fatalf("proxy: %v", err)
 	}
 	credHeader, err := loadCredHeader(*credFile)
 	if err != nil {
 		log.Fatalf("proxy: %v", err)
+	}
+	var principalKey ed25519.PrivateKey
+	if *principalKeyFile != "" {
+		if principalKey, err = loadPrivateKey(*principalKeyFile); err != nil {
+			log.Fatalf("proxy: principal key: %v", err)
+		}
 	}
 	var chainHeader string
 	if *delegationFile != "" {
@@ -178,12 +191,13 @@ func runProxy(args []string) {
 	}
 
 	h, err := newSidecar(sidecarConfig{
-		gatewayURL:  *gatewayURL,
-		instanceKey: key,
-		credHeader:  credHeader,
-		chainHeader: chainHeader,
-		token:       tokenSource(*tokenFile, *tokenEnv),
-		maxBody:     *maxBody,
+		gatewayURL:   *gatewayURL,
+		instanceKey:  key,
+		principalKey: principalKey,
+		credHeader:   credHeader,
+		chainHeader:  chainHeader,
+		token:        tokenSource(*tokenFile, *tokenEnv),
+		maxBody:      *maxBody,
 	})
 	if err != nil {
 		log.Fatalf("proxy: %v", err)
@@ -197,9 +211,13 @@ func runProxy(args []string) {
 type sidecarConfig struct {
 	gatewayURL  string
 	instanceKey ed25519.PrivateKey
-	credHeader  string
-	chainHeader string
-	token       func() (string, error)
+	// principalKey is the principal's did:key private key, nil outside VC mode. The principal
+	// credential is not a bearer token: a gateway in VC mode also wants a proof of possession
+	// of this key, bound to each request (vc.HolderProof).
+	principalKey ed25519.PrivateKey
+	credHeader   string
+	chainHeader  string
+	token        func() (string, error)
 	// maxBody caps the request body buffered to hash into the proof. It must be at least the
 	// gateway's own PASSPORT_MAX_REQUEST_BODY, or a body the gateway would have accepted is
 	// refused here first. Zero selects mcprpc.DefaultMaxBody, which is the gateway's default.
@@ -238,9 +256,21 @@ func newSidecar(cfg sidecarConfig) (http.Handler, error) {
 		if err != nil {
 			return // fail closed the same way: no proof, no admission
 		}
+		// The principal's own proof, when the deployment has a principal key: same binding,
+		// different key and context. Built per request for the same reason the instance proof
+		// is — it commits to this method, target and body.
+		var holder string
+		if cfg.principalKey != nil {
+			if holder, err = vc.HolderProof(cfg.principalKey, r.Method, vc.ProofTarget(r.URL), tok, body); err != nil {
+				return
+			}
+		}
 		r.Header.Set("Authorization", "Bearer "+tok)
 		r.Header.Set(workload.HeaderCredential, cfg.credHeader)
 		r.Header.Set(workload.HeaderProof, proof)
+		if holder != "" {
+			r.Header.Set(vc.HeaderPrincipalProof, holder)
+		}
 		if cfg.chainHeader != "" {
 			r.Header.Set(delegation.HeaderDelegation, cfg.chainHeader)
 		}
@@ -267,17 +297,19 @@ func newSidecar(cfg sidecarConfig) (http.Handler, error) {
 	}), nil
 }
 
-func loadInstanceKey(path string) (ed25519.PrivateKey, error) {
+// loadPrivateKey reads a base64url Ed25519 private key from a file. Both keys the sidecar
+// holds — the instance key and the principal key — are stored in that one form.
+func loadPrivateKey(path string) (ed25519.PrivateKey, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(string(b)))
 	if err != nil {
-		return nil, fmt.Errorf("bad instance key encoding: %w", err)
+		return nil, fmt.Errorf("bad key encoding: %w", err)
 	}
 	if len(raw) != ed25519.PrivateKeySize {
-		return nil, errors.New("instance key has wrong length")
+		return nil, errors.New("key has wrong length")
 	}
 	return ed25519.PrivateKey(raw), nil
 }

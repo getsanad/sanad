@@ -20,9 +20,11 @@ import {
   proofPayload,
   proofTarget,
   capabilityHolderProof,
+  principalHolderProof,
   sigctxMessage,
   CTX_INSTANCE_PROOF,
   CTX_CAPABILITY_HOLDER_PROOF,
+  CTX_VC_HOLDER_PROOF,
   bootstrapEvidence,
   requestNonce,
   enroll,
@@ -30,6 +32,7 @@ import {
   HEADER_CREDENTIAL,
   HEADER_PROOF,
   HEADER_DELEGATION,
+  HEADER_PRINCIPAL_PROOF,
 } from '../src/index.ts';
 
 // The 32-byte seed 0x01..0x20, base64url-encoded.
@@ -58,6 +61,10 @@ const EXPECTED_PROOF =
 // The same payload signed under the capability holder context.
 const EXPECTED_HOLDER_PROOF =
   'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw';
+// And under the principal (VC) holder context, which is what makes a principal credential
+// something other than a bearer token.
+const EXPECTED_PRINCIPAL_PROOF =
+  'eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.8TeIZgdZx6nsllD1fkMtIAD6WtXItJlK2C_D2-dOttLSHxPTH-HdKuVKEB6trOaoMHSfbadX2xyr6zjIcj6MBQ';
 
 /** The vector's proof input, with iat and jti pinned. */
 const VECTOR_INPUT = {
@@ -110,6 +117,16 @@ test('capabilityHolderProof is the same payload under a different context', () =
   // Same payload, different signature: an instance proof must not pass as a holder proof.
   assert.equal(holder.split('.')[0], EXPECTED_PROOF.split('.')[0]);
   assert.notEqual(holder.split('.')[1], EXPECTED_PROOF.split('.')[1]);
+});
+
+test('principalHolderProof is the same payload under the VC holder context', () => {
+  const holder = principalHolderProof(SEED_B64URL, VECTOR_INPUT);
+  assert.equal(holder, EXPECTED_PRINCIPAL_PROOF);
+  // Same payload as the other two; all three signatures differ, which is what stops a
+  // principal's did:key signature for one purpose being read as another.
+  assert.equal(holder.split('.')[0], EXPECTED_PROOF.split('.')[0]);
+  assert.notEqual(holder.split('.')[1], EXPECTED_PROOF.split('.')[1]);
+  assert.notEqual(holder.split('.')[1], EXPECTED_HOLDER_PROOF.split('.')[1]);
 });
 
 test('proofTarget yields the origin-form target both ends compare', () => {
@@ -233,6 +250,44 @@ test('PassportClient.headers builds the 3 base headers (no delegation)', () => {
   assert.equal(payload.bh, EXPECTED_BH);
   assert.equal(h[HEADER_DELEGATION], undefined);
   assert.equal(Object.prototype.hasOwnProperty.call(h, HEADER_DELEGATION), false);
+  // No principal key configured (OIDC mode): no principal proof.
+  assert.equal(Object.prototype.hasOwnProperty.call(h, HEADER_PRINCIPAL_PROOF), false);
+});
+
+test('PassportClient.headers includes X-Principal-Proof when a principal key is configured', () => {
+  const client = new PassportClient({
+    gatewayUrl: 'https://gw.example.com',
+    instanceKey: SEED_B64URL,
+    principalKey: SEED_B64URL,
+    credential: CRED_TEXT,
+  });
+  const h = client.headers('demo', '/mcp', {
+    principalToken: TOKEN,
+    method: METHOD,
+    body: BODY,
+  });
+  const proofHdr = h[HEADER_PRINCIPAL_PROOF]!;
+  const payload = JSON.parse(Buffer.from(proofHdr.split('.')[0]!, 'base64url').toString());
+  // Bound to this request, and to the credential being presented (ath).
+  assert.equal(payload.htm, METHOD);
+  assert.equal(payload.htu, '/servers/demo/mcp');
+  assert.equal(payload.ath, EXPECTED_ATH);
+  assert.equal(payload.bh, EXPECTED_BH);
+  // Signed under the VC holder context, not the instance one: the same key would produce a
+  // different signature for each, and the gateway checks them with different labels.
+  const raw = Buffer.from(proofHdr.split('.')[0]!, 'base64url');
+  const priv = createPrivateKey({
+    key: Buffer.concat([
+      Buffer.from('302e020100300506032b657004220420', 'hex'),
+      Buffer.from(SEED_B64URL, 'base64url'),
+    ]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  assert.equal(
+    proofHdr.split('.')[1],
+    edSign(null, sigctxMessage(CTX_VC_HOLDER_PROOF, raw), priv).toString('base64url'),
+  );
 });
 
 test('PassportClient.headers includes X-Agent-Delegation when configured', () => {

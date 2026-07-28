@@ -9,7 +9,8 @@
  *
  * This mirrors the Go sidecar (`passport proxy`, see cmd/passport/main.go): it
  * injects the principal bearer token, the workload credential, a proof of
- * possession of the instance key, and an optional delegation chain.
+ * possession of the instance key, a proof of possession of the principal's
+ * `did:key` when one is configured, and an optional delegation chain.
  *
  * Wire format notes (must match the Go implementation byte-for-byte):
  *   - All base64 is RFC 4648 URL-safe with NO padding (Go's base64.RawURLEncoding,
@@ -25,6 +26,10 @@
  *     context. See `proof` for why the body is covered when DPoP leaves it out.
  *     A proof therefore CANNOT be computed once and reused — that is the whole point,
  *     and a client that caches one will be denied on its second request.
+ *   - A gateway in VC mode expects TWO proofs on each request: one from the agent instance
+ *     (`X-Agent-Proof`) and one from the principal whose credential is being presented
+ *     (`X-Principal-Proof`). A principal credential is not a bearer token — see
+ *     `principalHolderProof` and the `principalKey` client option.
  *   - Enrolling is two requests: fetch a single-use nonce from the authority, then
  *     present attestation evidence covering both that nonce and the public key being
  *     enrolled. That binding is what stops an enrollment captured off the wire from
@@ -57,6 +62,8 @@ const ED25519_PRIVATE_LEN = 64; // Go's form: seed(32) || publicKey(32)
 export const HEADER_CREDENTIAL = 'X-Agent-Credential';
 export const HEADER_PROOF = 'X-Agent-Proof';
 export const HEADER_DELEGATION = 'X-Agent-Delegation';
+/** Matches Go's `vc.HeaderPrincipalProof`. Sent only when a principal key is configured. */
+export const HEADER_PRINCIPAL_PROOF = 'X-Principal-Proof';
 
 // ---------------------------------------------------------------------------
 // base64url helpers
@@ -98,6 +105,15 @@ export const CTX_INSTANCE_PROOF = 'sanad/instance-proof/v2';
  * can coincide.
  */
 export const CTX_CAPABILITY_HOLDER_PROOF = 'sanad/capability-holder-proof/v2';
+
+/**
+ * Context label for a principal holder proof (Go's `sigctx.VCHolderProof`): the presenter of
+ * a W3C-style principal credential proving possession of the credential subject's `did:key`
+ * private key. Again the same payload shape, and again the label is the only thing keeping
+ * one kind of signature from being read as another — a principal's `did:key` also signs
+ * delegation hops and, if it is an issuer, credentials.
+ */
+export const CTX_VC_HOLDER_PROOF = 'sanad/vc-holder-proof/v1';
 
 /**
  * Build the domain-separated signing input Go's `sigctx.Message` produces:
@@ -320,6 +336,23 @@ export function capabilityHolderProof(holderSecret: string, input: ProofInput): 
   return requestProof(CTX_CAPABILITY_HOLDER_PROOF, holderSecret, input);
 }
 
+/**
+ * Produce the `X-Principal-Proof` value for one request. Matches Go's `vc.HolderProof`.
+ *
+ * A gateway in VC mode (`PASSPORT_PRINCIPAL_MODE=vc`) does not treat the principal
+ * credential as a bearer token: the credential proves that a trusted issuer vouched for a
+ * `did:key`, and this proves that the caller actually holds that key, on this request. Both
+ * are required. Without it the credential would be exactly as good as a copy of it, which is
+ * what anything that sees one request's headers gets for free.
+ *
+ * `principalKey` is the base64url `did:key` private key of the credential SUBJECT — not the
+ * instance key, and not the issuer's key. `principalToken` must be the credential string
+ * exactly as it is sent in the Authorization header, since the proof commits to it (`ath`).
+ */
+export function principalHolderProof(principalKey: string, input: ProofInput): string {
+  return requestProof(CTX_VC_HOLDER_PROOF, principalKey, input);
+}
+
 // ---------------------------------------------------------------------------
 // Enrollment
 // ---------------------------------------------------------------------------
@@ -460,6 +493,13 @@ export interface PassportClientOptions {
   instanceKey: string;
   /** Raw workload credential JSON text, exactly as returned by `enroll`. */
   credential: string;
+  /**
+   * The principal's `did:key` private key, base64url (32-byte seed or 64-byte seed||pub).
+   * REQUIRED by gateways in VC mode, where the principal credential is not a bearer token and
+   * each request carries a proof of possession of this key (see `principalHolderProof`).
+   * Omit it in OIDC mode, where the principal has no such key.
+   */
+  principalKey?: string;
   /** Optional delegation chain JSON text. When present, sent as X-Agent-Delegation. */
   delegation?: string;
   /** Optional fetch implementation. Defaults to global fetch. */
@@ -467,7 +507,11 @@ export interface PassportClientOptions {
 }
 
 export interface RequestOptions {
-  /** Opaque principal bearer token; sent as `Authorization: Bearer <token>` and hashed into the proof. */
+  /**
+   * The principal bearer token; sent as `Authorization: Bearer <token>` and hashed into the
+   * proofs. Opaque to the SDK — an OIDC ID token, or a principal credential in VC mode, where
+   * it must be paired with the `principalKey` that credential's subject holds.
+   */
   principalToken: string;
   /** HTTP method (default GET). */
   method?: string;
@@ -489,6 +533,7 @@ export interface RequestOptions {
 export class PassportClient {
   private readonly gatewayUrl: string;
   private readonly instanceKey: string;
+  private readonly principalKey?: string;
   private readonly credentialHeader: string;
   private readonly delegationHeader?: string;
   private readonly fetchImpl: typeof fetch;
@@ -496,6 +541,7 @@ export class PassportClient {
   constructor(opts: PassportClientOptions) {
     this.gatewayUrl = opts.gatewayUrl.replace(/\/+$/, '');
     this.instanceKey = opts.instanceKey;
+    this.principalKey = opts.principalKey;
     // Encode the raw credential bytes once. Encoding the exact bytes (not a
     // re-serialization) preserves the signature the gateway verifies.
     this.credentialHeader = b64urlUtf8(opts.credential);
@@ -506,23 +552,29 @@ export class PassportClient {
 
   /**
    * Build the passport headers for ONE request: Authorization plus X-Agent-Credential and
-   * X-Agent-Proof, and X-Agent-Delegation only when a delegation chain was configured.
+   * X-Agent-Proof, X-Principal-Proof when a principal key was configured, and
+   * X-Agent-Delegation when a delegation chain was.
    *
-   * It takes the request — server, path, method and body — because the proof is bound to
+   * It takes the request — server, path, method and body — because the proofs are bound to
    * all of them. The returned headers are good for that request and no other; building
    * them once and reusing them across calls is the bug this construction exists to fix.
    */
   headers(serverId: string, path: string, opts: RequestOptions): Record<string, string> {
+    const input: ProofInput = {
+      method: opts.method ?? 'GET',
+      target: proofTarget(this.url(serverId, path)),
+      principalToken: opts.principalToken,
+      body: opts.body,
+    };
     const h: Record<string, string> = {
       Authorization: `Bearer ${opts.principalToken}`,
       [HEADER_CREDENTIAL]: this.credentialHeader,
-      [HEADER_PROOF]: proof(this.instanceKey, {
-        method: opts.method ?? 'GET',
-        target: proofTarget(this.url(serverId, path)),
-        principalToken: opts.principalToken,
-        body: opts.body,
-      }),
+      [HEADER_PROOF]: proof(this.instanceKey, input),
     };
+    // The same `input` for both: it carries no `iat` or `jti`, so each call fills in its own.
+    if (this.principalKey !== undefined) {
+      h[HEADER_PRINCIPAL_PROOF] = principalHolderProof(this.principalKey, input);
+    }
     if (this.delegationHeader !== undefined) {
       h[HEADER_DELEGATION] = this.delegationHeader;
     }

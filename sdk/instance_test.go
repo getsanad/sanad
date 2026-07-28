@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +17,9 @@ import (
 	"github.com/getsanad/sanad/delegation"
 	"github.com/getsanad/sanad/gateway"
 	"github.com/getsanad/sanad/pkg/types"
+	"github.com/getsanad/sanad/principal"
 	"github.com/getsanad/sanad/sts"
+	"github.com/getsanad/sanad/vc"
 	"github.com/getsanad/sanad/workload"
 )
 
@@ -91,6 +95,67 @@ func TestWithInstanceIsAcceptedByTheGateway(t *testing.T) {
 	// Buffering the body to hash it must not cost the upstream the bytes.
 	if upstreamBody != body {
 		t.Fatalf("upstream received %q, want it forwarded intact: %q", upstreamBody, body)
+	}
+}
+
+// A Go agent using WithPrincipalKey is admitted by a gateway in VC mode, where the principal
+// credential is not a bearer token — and the same client without the key is not, however
+// valid the credential it presents.
+func TestWithPrincipalKeyIsAcceptedByAVCGateway(t *testing.T) {
+	issuerPub, issuerPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuerDID := vc.EncodeDIDKey(issuerPub)
+	principalPub, principalPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := vc.Issue(issuerDID, issuerPriv,
+		vc.Subject{ID: vc.EncodeDIDKey(principalPub), Assurance: types.AssuranceOrg}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	credJSON, _ := json.Marshal(cred)
+	token := base64.RawURLEncoding.EncodeToString(credJSON)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	reg := gateway.NewRegistry()
+	u, _ := url.Parse(upstream.URL)
+	if err := reg.Register(&gateway.Server{ID: "demo", Upstream: u}); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := sts.NewLocalSigner("kid-gw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := httptest.NewServer(&gateway.Gateway{Registry: reg, Pipeline: gateway.Pipeline{Stages: []gateway.Stage{
+		principal.Stage(vc.NewAuthenticator(vc.StaticTrust{issuerDID: true})),
+		sts.MintStage(sts.New(signer, sts.Config{Issuer: "sanad"})),
+	}}})
+	defer gw.Close()
+
+	call := func(opts ...Option) int {
+		t.Helper()
+		c := New(gw.URL, func(context.Context) (string, error) { return token, nil }, opts...)
+		resp, err := c.Call(context.Background(), "demo", http.MethodPost, "/mcp",
+			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := call(WithPrincipalKey(principalPriv)); code != http.StatusOK {
+		t.Fatalf("call with a principal key got %d, want 200", code)
+	}
+	if code := call(); code == http.StatusOK {
+		t.Fatal("the credential alone was admitted: it is a bearer token again")
 	}
 }
 

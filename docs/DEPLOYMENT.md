@@ -33,6 +33,7 @@ go run ./cmd/passport enroll --authority http://localhost:8082 --token dev-token
 
 PASSPORT_PRINCIPAL_TOKEN=$(cat deploy/secrets/principal.token) \
   go run ./cmd/passport proxy --gateway http://localhost:8080 \
+    --principal-key deploy/secrets/principal.key \
     --key agent.key --credential cred.json --delegation deploy/secrets/delegation.json &
 
 curl -s localhost:7070/servers/demo/tools/list | jq .

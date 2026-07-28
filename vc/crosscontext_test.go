@@ -46,7 +46,7 @@ func TestVCProofIsNotADelegationHop(t *testing.T) {
 	}
 
 	// Each still verifies as itself.
-	if _, err := Verify(cred, StaticTrust{did: true}, now); err != nil {
+	if _, _, err := Verify(cred, StaticTrust{did: true}, now); err != nil {
 		t.Fatalf("a genuine credential must still verify: %v", err)
 	}
 	chain, err := delegation.NewRoot(priv, did, "agent-1", delegation.Grant{Tools: []string{"read"}})
@@ -83,7 +83,7 @@ func TestDelegationHopIsNotAVCProof(t *testing.T) {
 	}
 	cred.Proof.ProofValue = base64.RawURLEncoding.EncodeToString(chain.Hops[0].Signature)
 
-	if _, err := Verify(cred, StaticTrust{did: true}, now); err == nil {
+	if _, _, err := Verify(cred, StaticTrust{did: true}, now); err == nil {
 		t.Fatal("a delegation hop signature was accepted as a VC issuer proof")
 	}
 }

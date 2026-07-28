@@ -34,6 +34,9 @@ async function main(): Promise<void> {
   const gatewayUrl = process.env.PASSPORT_GATEWAY;
   const bootstrapToken = process.env.PASSPORT_BOOTSTRAP_TOKEN ?? 'demo-bootstrap-token';
   const principalToken = process.env.PASSPORT_PRINCIPAL_TOKEN ?? 'demo-principal-token';
+  // In VC mode the principal token is a credential, not a bearer token: the gateway also
+  // wants a per-request proof of possession of the subject's did:key. Unset in OIDC mode.
+  const principalKey = process.env.PASSPORT_PRINCIPAL_KEY;
 
   // Use in-process fakes unless real endpoints are provided.
   const useFakes = !authorityUrl || !gatewayUrl;
@@ -52,6 +55,7 @@ async function main(): Promise<void> {
   const client = new PassportClient({
     gatewayUrl: gatewayUrl ?? 'https://gw.local',
     instanceKey: key.privateKey,
+    principalKey,
     credential,
     fetch: fakeFetch,
   });

@@ -89,7 +89,8 @@ func main() {
 	chainHdr, _ := delegation.EncodeChain(chain)
 
 	section("Setup")
-	fmt.Println("- Issued a Verifiable Credential for the principal (did:key)")
+	fmt.Println("- Issued a Verifiable Credential for the principal (did:key), presented with a")
+	fmt.Println("  per-request proof of possession of the principal's key (holder binding)")
 	fmt.Println("- Issued a short-lived workload credential for agent-1 (via nonce-bound attestation)")
 	fmt.Println("- Built delegation chain: principal -> agent-1, scope=[read]")
 
@@ -157,14 +158,21 @@ func main() {
 	gw := httptest.NewServer(g)
 	defer gw.Close()
 
-	// The proof is built per request: it commits to this request's method, target and body,
-	// so the header bundle from one call authenticates nothing else (workload.Proof).
+	// Both proofs are built per request: each commits to this request's method, target and
+	// body, so the header bundle from one call authenticates nothing else. The principal proof
+	// is what stops the VC from being a bearer blob — it needs the principal's private key,
+	// which a copy of the credential does not carry (vc.HolderProof).
 	authorize := func(req *http.Request, body []byte) {
 		proof, err := workload.Proof(a1Priv, req.Method, workload.ProofTarget(req.URL), bearer, body)
 		if err != nil {
 			panic(err)
 		}
+		holder, err := vc.HolderProof(principalPriv, req.Method, vc.ProofTarget(req.URL), bearer, body)
+		if err != nil {
+			panic(err)
+		}
 		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set(vc.HeaderPrincipalProof, holder)
 		req.Header.Set(workload.HeaderCredential, credHdr)
 		req.Header.Set(workload.HeaderProof, proof)
 		req.Header.Set(delegation.HeaderDelegation, chainHdr)
@@ -259,8 +267,25 @@ func main() {
 	code, _ = mcp(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read"}}`)
 	fmt.Printf("tools/call read -> %d (recovered, no restart)\n", code)
 
-	// --- request 2: denied after revocation ---------------------------------------
-	section("Request 2: revoke the principal, then call again")
+	// --- request 2: the credential without the key --------------------------------
+	// The credential travels in a header on every request, so it lands in logs, in proxies and
+	// in the upstream. Copying it buys nothing: the principal's private key was never on the
+	// wire, and without it the holder proof cannot be made. This is agent-1 — a legitimately
+	// enrolled instance, with its own valid credential and instance proof — trying to act AS
+	// the principal by presenting a credential it merely saw.
+	section("Request 2: the same credential, presented without the principal's key")
+	_, thiefPriv := genKey()
+	stolen, _ := http.NewRequest(http.MethodGet, gw.URL+"/servers/demo/tools/list", nil)
+	authorize(stolen, nil)
+	forged, _ := vc.HolderProof(thiefPriv, stolen.Method, vc.ProofTarget(stolen.URL), bearer, nil)
+	stolen.Header.Set(vc.HeaderPrincipalProof, forged)
+	resp3, _ := http.DefaultClient.Do(stolen)
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	fmt.Printf("Gateway -> %d (%s) — the VC is not a bearer token (FR-13)\n", resp3.StatusCode, trim(body3))
+
+	// --- request 3: denied after revocation ---------------------------------------
+	section("Request 3: revoke the principal, then call again")
 	_ = ks.Revoke(principalDID) // in-process store: cannot fail
 	resp2, _ := send()
 	body2, _ := io.ReadAll(resp2.Body)

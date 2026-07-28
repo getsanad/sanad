@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/getsanad/sanad/delegation"
+	"github.com/getsanad/sanad/vc"
 	"github.com/getsanad/sanad/workload"
 )
 
@@ -30,10 +31,11 @@ type Client struct {
 	tokens     TokenSource
 	http       *http.Client
 
-	instanceKey ed25519.PrivateKey // set by WithInstance; nil means principal-only calls
-	credHeader  string
-	chainHeader string
-	cfgErr      error // deferred from an Option, returned by Call
+	instanceKey  ed25519.PrivateKey // set by WithInstance; nil means principal-only calls
+	principalKey ed25519.PrivateKey // set by WithPrincipalKey; nil outside VC mode
+	credHeader   string
+	chainHeader  string
+	cfgErr       error // deferred from an Option, returned by Call
 }
 
 // Option configures a Client.
@@ -67,6 +69,27 @@ func WithInstance(key ed25519.PrivateKey, cred workload.Credential) Option {
 	}
 }
 
+// WithPrincipalKey gives the client the principal's did:key private key, so every call
+// carries a fresh proof of possession of it bound to that request (vc.HolderProof).
+//
+// Gateways in VC mode (PASSPORT_PRINCIPAL_MODE=vc) require it: the principal credential in
+// the Authorization header proves that a trusted issuer vouched for a did:key, and nothing
+// more. Whoever copies that header — from a log, a proxy, the upstream server — holds the
+// whole credential, so without a proof that the caller also holds the key it names, the
+// credential is a bearer token for a human being's identity. Omit this in OIDC mode, where
+// the principal has no such key.
+func WithPrincipalKey(key ed25519.PrivateKey) Option {
+	return func(c *Client) {
+		// Same reasoning as WithInstance: a bad key is a configuration error raised on the
+		// first call, never a silent downgrade to sending no proof at all.
+		if len(key) != ed25519.PrivateKeySize {
+			c.cfgErr = fmt.Errorf("sdk: principal key must be %d bytes, got %d", ed25519.PrivateKeySize, len(key))
+			return
+		}
+		c.principalKey = key
+	}
+}
+
 // WithDelegation attaches a verified delegation chain to every call, the way the `passport
 // proxy` sidecar does. Gateways wired with delegation.WithRequireChain reject calls without one.
 func WithDelegation(chain delegation.Chain) Option {
@@ -97,11 +120,12 @@ func New(gatewayURL string, tokens TokenSource, opts ...Option) *Client {
 // Call sends a request to the given protected MCP server through the gateway. path is the
 // upstream path (e.g. "/tools/list"); the SDK prefixes the gateway's /servers/{server}
 // namespace and attaches the principal credential, plus the instance credential and proof
-// when WithInstance was given. The caller owns closing the response body.
+// when WithInstance was given and the principal holder proof when WithPrincipalKey was.
+// The caller owns closing the response body.
 //
-// With an instance identity configured, body is read into memory before the request is sent:
-// the proof commits to a hash of the bytes, so they have to exist before the first one goes
-// out. Without one, body is streamed exactly as before.
+// With either key configured, body is read into memory before the request is sent: a proof
+// commits to a hash of the bytes, so they have to exist before the first one goes out.
+// Without one, body is streamed exactly as before.
 func (c *Client) Call(ctx context.Context, server, method, path string, body io.Reader) (*http.Response, error) {
 	if c.cfgErr != nil {
 		return nil, c.cfgErr
@@ -119,7 +143,7 @@ func (c *Client) Call(ctx context.Context, server, method, path string, body io.
 	url := fmt.Sprintf("%s/servers/%s%s", c.gatewayURL, server, path)
 
 	var raw []byte
-	if c.instanceKey != nil && body != nil {
+	if (c.instanceKey != nil || c.principalKey != nil) && body != nil {
 		if raw, err = io.ReadAll(body); err != nil {
 			return nil, fmt.Errorf("sdk: reading request body: %w", err)
 		}
@@ -138,6 +162,13 @@ func (c *Client) Call(ctx context.Context, server, method, path string, body io.
 		}
 		req.Header.Set(workload.HeaderCredential, c.credHeader)
 		req.Header.Set(workload.HeaderProof, proof)
+	}
+	if c.principalKey != nil {
+		holder, err := vc.HolderProof(c.principalKey, req.Method, vc.ProofTarget(req.URL), tok, raw)
+		if err != nil {
+			return nil, fmt.Errorf("sdk: building the principal holder proof: %w", err)
+		}
+		req.Header.Set(vc.HeaderPrincipalProof, holder)
 	}
 	if c.chainHeader != "" {
 		req.Header.Set(delegation.HeaderDelegation, c.chainHeader)

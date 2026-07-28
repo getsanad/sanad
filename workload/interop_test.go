@@ -57,6 +57,11 @@ const (
 	// differs only in the context label, which is the whole point of sigctx.
 	vecHolderProof = "eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.y-dA1G8M220lQyMubM0EyB8V2qAfznj-PA2WWHMYvmmgye7iNT60q4xXJW73e5hux4niRagPGEYNDYz7HQ5DAw"
 
+	// The same payload signed as a PRINCIPAL holder proof (X-Principal-Proof): the presenter
+	// of a principal credential proving possession of the subject's did:key. Again the only
+	// difference is the context label.
+	vecPrincipalProof = "eyJhdGgiOiJlYVZkYzI0TUY1cmJLcFRYV0RJNVctdFhITmZBMS1xdkZqd1E0R0loamxJIiwiYmgiOiJxWERiYlNiQUlBcXRUcF9wYUZURDVHSzNGcERQVXlNZmR3M00tQmVXcFd3IiwiaHRtIjoiUE9TVCIsImh0dSI6Ii9zZXJ2ZXJzL2RlbW8vbWNwIiwiaWF0IjoxNzY3MjI1NjAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.8TeIZgdZx6nsllD1fkMtIAD6WtXItJlK2C_D2-dOttLSHxPTH-HdKuVKEB6trOaoMHSfbadX2xyr6zjIcj6MBQ"
+
 	// BootstrapEvidence("boot-token", nonce 0x00..0x1f, vecPub).
 	vecNonceB64    = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 	vecEvidenceB64 = "umfR1kxOzPGX1ZFOK5pgnnRtnxSm-q3nE-Qx6DPsI1o"
@@ -147,6 +152,23 @@ func TestInteropHolderProofVector(t *testing.T) {
 	}
 	if got == vecProof {
 		t.Fatal("the instance proof and the holder proof over one payload must differ")
+	}
+}
+
+// The principal holder proof is the same payload again, under the VC holder context. The
+// principal's did:key signs delegation hops and issued credentials too, so a proof that
+// verified under any of those labels would be a signing oracle for the others.
+func TestInteropPrincipalHolderProofVector(t *testing.T) {
+	priv := vecKey(t)
+	got, err := pop.Sign(sigctx.VCHolderProof, priv, vecBinding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != vecPrincipalProof {
+		t.Fatalf("principal holder proof = %s, want %s", got, vecPrincipalProof)
+	}
+	if got == vecProof || got == vecHolderProof {
+		t.Fatal("the three proofs over one payload must all differ")
 	}
 }
 

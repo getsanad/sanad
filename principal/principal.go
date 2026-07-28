@@ -21,6 +21,18 @@ type Authenticator interface {
 	Authenticate(ctx context.Context, rawToken string) (*types.Principal, error)
 }
 
+// RequestAuthenticator is an Authenticator whose credential cannot be checked from the token
+// alone. A credential the holder must prove possession of a key for — a VC over a did:key,
+// vc.Authenticator — binds that proof to the request in front of the verifier, so it needs
+// the request and the buffered body, not just the bearer string. Stage prefers this method
+// whenever the authenticator offers it, and there is deliberately no fallback: an
+// authenticator that requires the binding must not be reachable through the path that skips
+// it.
+type RequestAuthenticator interface {
+	Authenticator
+	AuthenticateRequest(ctx context.Context, rawToken string, r *http.Request, body []byte) (*types.Principal, error)
+}
+
 // StatusChecker reports whether a principal has been revoked/disabled (the kill-switch,
 // P1-07). Authentication fails closed when a principal is revoked.
 type StatusChecker interface {
@@ -92,6 +104,9 @@ func (a *OIDCAuthenticator) Authenticate(ctx context.Context, raw string) (*type
 // authenticates the principal, and sets it on the request — failing closed if the token
 // is missing or invalid. The mint stage (sts.MintStage) later strips this inbound token
 // and forwards only the minted passport (FR-8).
+//
+// An authenticator that also implements RequestAuthenticator is given the request and the
+// buffered body, so it can check a proof of possession bound to them.
 func Stage(a Authenticator) gateway.Stage {
 	return gateway.NewStage("principal", func(ctx context.Context, req *gateway.Request) error {
 		if req.HTTP == nil {
@@ -101,13 +116,21 @@ func Stage(a Authenticator) gateway.Stage {
 		if !ok {
 			return errors.New("principal: missing bearer token")
 		}
-		p, err := a.Authenticate(ctx, raw)
+		p, err := authenticate(ctx, a, raw, req)
 		if err != nil {
 			return err
 		}
 		req.Principal = p
 		return nil
 	})
+}
+
+// authenticate picks the richer method when the authenticator has one.
+func authenticate(ctx context.Context, a Authenticator, raw string, req *gateway.Request) (*types.Principal, error) {
+	if ra, ok := a.(RequestAuthenticator); ok {
+		return ra.AuthenticateRequest(ctx, raw, req.HTTP, req.Body)
+	}
+	return a.Authenticate(ctx, raw)
 }
 
 func bearer(r *http.Request) (string, bool) {

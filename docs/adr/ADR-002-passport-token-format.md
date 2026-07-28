@@ -10,9 +10,9 @@ The passport (PRD FR-7) is the only credential the MCP server sees. It must be s
 ## Decision
 Use **JWT** (JWS) for the v1 passport, **hardened** so JOSE's well-known footguns are
 designed out. Claims: `jti`, `iss`, `sub` (principal), `aud` (single target server),
-`iat`, `exp`, plus custom `agent`, `scope`, and (empty in P1) `delegation`. Keys
-published via JWKS for offline verification (consumed by P1-05); keys move to KMS/HSM
-in P1-12.
+`iat`, `exp`, plus custom `agent`, `scope`, `budget`, and `dlg` (the delegation
+reference — see below). Keys published via JWKS for offline verification (consumed by
+P1-05); keys move to KMS/HSM in P1-12.
 
 ### Mandatory hardening (these are requirements, not options)
 - **EdDSA / Ed25519 only.** A single asymmetric algorithm; **ECDSA P-256** is the only
@@ -50,7 +50,14 @@ in P1-12.
 - Ubiquitous library support; trivial offline verification via JWKS (FR-9).
 - `aud` gives us audience binding for free (SEC-2): a passport for server A fails at server B.
 - Short `exp` is the primary revocation lever (FR-17) — non-renewal self-terminates access.
-- The delegation chain uses **Biscuit** (P2-04/P2-07); the passport's `delegation` claim
-  references the verified chain, keeping the base passport format stable.
+- The delegation chain is verified gateway-side and the passport's `dlg` claim **references**
+  the verified chain rather than embedding it: the ordered path of parties plus a SHA-256
+  digest of the full signed chain. This keeps the base passport format stable and keeps the
+  hot path cheap — a three-party chain costs ~230 bytes as a reference against ~770 embedded,
+  on a credential sent with every request — and it loses nothing enforceable, since a resource
+  server has no registry of principal/agent keys with which to check a hop signature. The
+  digest keeps the reference honest: an auditor holding the full chain can prove the passport
+  was minted from it. Full-chain formats (**Biscuit**, P2-07) remain the direction for offline
+  holder-side attenuation (FR-12b), where the holder *does* need the chain itself.
 - Hardening is enforced in one wrapped `Sign`/`Verify` path, so no individual call site
   can re-introduce an `alg:none`/confusion bug.

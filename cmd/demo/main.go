@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/getsanad/sanad/audit"
@@ -32,6 +33,7 @@ import (
 	"github.com/getsanad/sanad/revoke"
 	"github.com/getsanad/sanad/sts"
 	"github.com/getsanad/sanad/vc"
+	"github.com/getsanad/sanad/verify"
 	"github.com/getsanad/sanad/workload"
 )
 
@@ -134,12 +136,38 @@ func main() {
 	tok := forwardedAuth[len("Bearer "):]
 	claims, _ := passport.Verify(signer.Public(), tok, "demo", time.Now())
 	fmt.Println("\nThe upstream received a freshly-minted PASSPORT (not the principal's VC):")
-	fmt.Printf("  principal : %s\n  agent     : %s\n  audience  : %s\n  scope     : %v\n  expires   : %s (in %s)\n",
-		claims.Principal, claims.Agent, claims.Audience, claims.Tools,
+	fmt.Printf("  principal : %s\n  agent     : %s\n  audience  : %s\n  scope     : %v\n",
+		claims.Principal, claims.Agent, claims.Audience, claims.Tools)
+	if claims.Delegation != nil {
+		// The chain travels ON the passport, inside the signature: the MCP server can see
+		// the accountability path without asking the gateway anything (FR-10).
+		fmt.Printf("  delegation: %s\n              (chain digest %s — an auditor holding the full\n"+
+			"               chain can prove this passport was minted from it)\n",
+			strings.Join(claims.Delegation.Path, " -> "), short(claims.Delegation.Digest))
+	}
+	fmt.Printf("  expires   : %s (in %s)\n",
 		time.Unix(claims.ExpiresAt, 0).Format(time.RFC3339), time.Until(time.Unix(claims.ExpiresAt, 0)).Round(time.Second))
 	if bearer != tok {
 		fmt.Println("  (the caller's VC was stripped and never forwarded — token isolation, FR-8)")
 	}
+	fmt.Printf("  token size: %d bytes, sent on every request\n", len(tok))
+
+	// --- what the MCP server does with it -------------------------------------------
+	section("The MCP server enforces the scope itself")
+	rs := verify.New(verify.StaticKeys{"kid-gw": signer.Public()})
+	protected := verify.Middleware(rs, "demo",
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ran the tool") }),
+		verify.EnforceScope())
+	for _, tool := range []string{"read", "delete"} {
+		rec := httptest.NewRecorder()
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tool + `"}}`
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		protected.ServeHTTP(rec, req)
+		fmt.Printf("  tools/call %-7s -> %d %s\n", tool, rec.Code, trim(rec.Body.Bytes()))
+	}
+	fmt.Println("  (the passport is scoped to [read]; the server refuses the rest offline,")
+	fmt.Println("   with no callback to the gateway — verify.EnforceScope)")
 
 	// --- request 2: denied after revocation ---------------------------------------
 	section("Request 2: revoke the principal, then call again")

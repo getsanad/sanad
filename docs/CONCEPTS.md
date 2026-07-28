@@ -79,6 +79,34 @@ powers, never more.* Like a power of attorney: if you can spend up to $100, anyo
 delegate to can spend $100 or less — never more. We check the whole chain and reject it if
 any link tries to widen its powers, or if any signature is faked.
 
+**The chain travels with the pass.** The passport carries the *path* — "this human → this
+agent → this sub-agent" — plus a fingerprint (hash) of the whole signed chain, all inside the
+gateway's signature. So the destination system doesn't just learn *which agent* is calling;
+it learns *who is accountable and through whom*, without asking us anything.
+
+Why the path and a fingerprint rather than the whole chain? Two reasons. The pass is attached
+to every single request, and the full chain — every hop's signature — roughly doubles its
+size. And the destination system couldn't check those signatures anyway: doing that needs each
+delegator's public key, which the gateway has and it doesn't. The fingerprint is what keeps
+the short version honest — anyone who later holds the real chain (an auditor reading the log,
+or the agent itself) can recompute it and prove the pass came from *that* chain and no other.
+Continuing the analogy: the visa lists the sponsor and carries a reference number for the
+paperwork; the border officer reads the names, and an investigator can pull the file.
+
+### What the destination system checks by itself
+The MCP server runs its own checks on the pass, offline, with no call back to us:
+
+- **Is this real?** — signed by the gateway's key.
+- **Is it for me?** — a pass for system A is refused at system B.
+- **Is it still valid?** — passports expire in minutes.
+- **Who is accountable?** — the human, the agent, and the delegation path between them.
+- **Is this action allowed?** — the tool being invoked must be one the pass names. A pass
+  scoped to "read" is refused for "delete", *by the destination system itself*. That matters
+  because it holds even if something reaches the server by another route.
+
+One thing it can't check alone: whether we revoked the human *since* the pass was issued.
+That's what the short expiry is for — the window is minutes, not months.
+
 ### Revocation + kill-switch
 **Revoking** = cutting off access. Because passports are short-lived, the main lever is
 simply "stop issuing." The **kill-switch** is an instant deny-list the gateway checks: put
@@ -141,7 +169,7 @@ Each folder is one responsibility:
 | `policy/` | The rules engine: "is this allowed?" (deny by default) |
 | `revoke/` | The kill-switch / instant deny-list |
 | `sts/` | Mints (creates and signs) the short-lived passports |
-| `verify/` | A small library destination systems use to check a passport |
+| `verify/` | A small library destination systems use to check a passport — and to refuse tools it doesn't name |
 | `delegation/` | Signed handoff chains + the "can only narrow" rule |
 | `audit/` | The tamper-evident record of every decision |
 | `metrics/` | Health/speed numbers for operators |

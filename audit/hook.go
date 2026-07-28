@@ -34,13 +34,9 @@ func GatewayHook(l Log) gateway.AuditFunc {
 		if req.Passport != nil {
 			e.PassportID = req.Passport.ID
 		}
-		if req.Delegation != nil && len(req.Delegation.Hops) > 0 {
-			path := []string{req.Delegation.Hops[0].Delegator}
-			for _, h := range req.Delegation.Hops {
-				path = append(path, h.Delegate)
-			}
-			e.Delegation = path
-		}
+		// Same derivation the passport's `dlg` claim uses, so the path in the log and the
+		// path the resource server was handed are the same string by construction.
+		e.Delegation = req.Delegation.Path()
 		if err := l.Append(context.Background(), e); err != nil {
 			log.Printf("audit: append failed: %v", err)
 		}

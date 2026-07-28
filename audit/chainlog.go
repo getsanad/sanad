@@ -97,9 +97,11 @@ func contentHash(prev []byte, e Entry) []byte {
 		Delegation []string `json:"delegation"`
 		Effect     string   `json:"effect"`
 		DReason    string   `json:"decision_reason"`
+		Drift      *Drift   `json:"drift"`
 	}{
 		At: e.At.UnixNano(), Action: e.Action, Reason: e.Reason, Server: e.Server,
 		Principal: e.Principal, Agent: e.Agent, PassportID: e.PassportID, Delegation: e.Delegation,
+		Drift: e.Drift,
 	}
 	if e.Decision != nil {
 		view.Effect = string(e.Decision.Effect)

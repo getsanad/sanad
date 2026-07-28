@@ -37,6 +37,11 @@ func (r *Registry) Register(s *Server) error {
 	p := httputil.NewSingleHostReverseProxy(s.Upstream)
 	// Flush immediately so SSE / streamable-HTTP responses are not buffered.
 	p.FlushInterval = -1
+	// The response seam (gateway/response.go). It is always installed and does nothing unless
+	// the in-flight request carries a hook, so a gateway with no inspector proxies exactly as
+	// it did before; ErrorHandler is what lets a refusal answer 403 instead of 502.
+	p.ModifyResponse = inspectResponse
+	p.ErrorHandler = proxyError
 	s.proxy = p
 
 	r.mu.Lock()

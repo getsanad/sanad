@@ -6,8 +6,10 @@
 //
 //	PASSPORT_GATEWAY_ADDR        listen address (default :8080)
 //	PASSPORT_SERVERS             "id=upstreamURL,id2=url2" protected MCP servers
-//	PASSPORT_POLICY_FILE         path to the authorization config (see the config package);
-//	                             unset = deny everything
+//	PASSPORT_POLICY_FILE         path to the configuration document (see the config package):
+//	                             the "policy" section authorizes actions, the optional
+//	                             "tooldefs" section pins each server's approved tool
+//	                             definitions; unset = deny everything, pin nothing
 //	PASSPORT_ALLOW_ALL           1 = permit every action (development only; refuses to start
 //	                             alongside PASSPORT_POLICY_FILE)
 //	PASSPORT_APPROVAL_TIMEOUT    how long an action held for human approval waits before it is
@@ -63,6 +65,7 @@ import (
 	"github.com/getsanad/sanad/revoke"
 	pgrevoke "github.com/getsanad/sanad/revoke/postgres"
 	"github.com/getsanad/sanad/sts"
+	"github.com/getsanad/sanad/tooldefs"
 	"github.com/getsanad/sanad/vc"
 	"github.com/getsanad/sanad/workload"
 
@@ -84,7 +87,7 @@ func main() {
 		log.Fatalf("gateway: signer: %v", err)
 	}
 
-	pipeline, killSwitch, approver, err := buildPipeline(context.Background(), signer, reg)
+	pipeline, killSwitch, approver, drift, err := buildPipeline(context.Background(), signer, reg)
 	if err != nil {
 		log.Fatalf("gateway: pipeline: %v", err)
 	}
@@ -109,6 +112,15 @@ func main() {
 		MaxRequestBody: maxBody,
 	}
 
+	// Tool-definition pinning (SEC-3). The guard needs the response path, because the tool
+	// definitions it checks arrive in a tools/list RESPONSE and are invisible to every stage
+	// above; it is nil, and the response path untouched, unless the config file pins something.
+	if drift != nil {
+		drift.Audit = audit.ToolDefsHook(auditLog)
+		drift.Logf = log.Printf
+		g.Inspect = drift.Inspect
+	}
+
 	// Expose metrics at /metrics and instrument all gateway traffic (P1-11).
 	reg2 := metrics.NewRegistry()
 	// Snapshot age is the observable form of the revocation window: alert on it approaching
@@ -119,6 +131,11 @@ func main() {
 	reg2.SetGauge("agentpassport_revocation_max_staleness_seconds",
 		"Snapshot age at which revocation checks start denying (0 = no bound configured).",
 		func() float64 { return killSwitch.MaxStaleness().Seconds() })
+	// Drift that only reaches a log line is drift nobody pages on. Anything above zero here is
+	// a protected server whose advertised tools no longer match what was approved (P1-11).
+	reg2.SetGauge("agentpassport_tooldefs_quarantined_servers",
+		"Protected servers currently quarantined for tool-definition drift (SEC-3).",
+		func() float64 { return float64(drift.QuarantinedCount()) })
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg2.Handler())
 	mux.Handle("/.well-known/jwks.json", jwks.Handler(jwks.Key{Kid: signer.KeyID(), Pub: signer.Public()}))
@@ -182,18 +199,20 @@ func registerServers(reg *gateway.Registry, spec string) error {
 }
 
 // buildPipeline assembles the decision pipeline from configuration. It also returns the
-// kill-switch it wired, so main can surface its snapshot age on /readyz and /metrics, and the
+// kill-switch it wired, so main can surface its snapshot age on /readyz and /metrics; the
 // approver holding actions routed to human review, so main can mount the API that resolves
-// them. reg is read-only here: the policy file is cross-checked against it, so a server id
-// typo'd in one and not the other is reported rather than silently denying everything.
-func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry) (gateway.Pipeline, *revoke.CachedStore, *policy.ManualApprover, error) {
+// them; and the tool-definition guard, so main can give it an audit sink and hang it on the
+// gateway's response path. reg is read-only here: the config file is cross-checked against it,
+// so a server id typo'd in one and not the other is reported rather than silently denying
+// everything.
+func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry) (gateway.Pipeline, *revoke.CachedStore, *policy.ManualApprover, *tooldefs.Guard, error) {
 	// One kill-switch enforced at both authentication and mint time (P1-07). Reads are
 	// served from a local snapshot (hot path never makes a DB call, FR-20); when a shared
 	// Postgres source is configured the snapshot refreshes so revocations propagate across
 	// replicas (NFR-2).
 	ks, err := buildKillSwitch()
 	if err != nil {
-		return gateway.Pipeline{}, nil, nil, err
+		return gateway.Pipeline{}, nil, nil, nil, err
 	}
 
 	// Optional workload identity. Its key store also lets the VC principal authenticator
@@ -203,7 +222,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 	if caB64 := os.Getenv("PASSPORT_WORKLOAD_CA"); caB64 != "" {
 		pub, derr := base64.RawURLEncoding.DecodeString(caB64)
 		if derr != nil || len(pub) != ed25519.PublicKeySize {
-			return gateway.Pipeline{}, nil, nil, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
+			return gateway.Pipeline{}, nil, nil, nil, fmt.Errorf("gateway: PASSPORT_WORKLOAD_CA must be a base64url Ed25519 public key: %v", derr)
 		}
 		caPub = ed25519.PublicKey(pub)
 		store = workload.NewKeyStore(caPub)
@@ -211,7 +230,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 
 	auth, err := buildPrincipalAuth(ctx, ks, store)
 	if err != nil {
-		return gateway.Pipeline{}, nil, nil, err
+		return gateway.Pipeline{}, nil, nil, nil, err
 	}
 	// Never serve unauthenticated by accident. A pipeline with no principal stage mints no
 	// passport, so the gateway denies every proxied request (gateway/proxy.go) while looking
@@ -223,11 +242,11 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 			if os.Getenv("PASSPORT_PRINCIPAL_MODE") == "vc" {
 				need = "PASSPORT_VC_TRUSTED_ISSUERS"
 			}
-			return gateway.Pipeline{}, nil, nil, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
+			return gateway.Pipeline{}, nil, nil, nil, fmt.Errorf("no principal authenticator configured (PASSPORT_PRINCIPAL_MODE=%s): set %s, or set PASSPORT_DEV_NO_AUTH=1 to start without authentication (development only — every proxied request is then denied)",
 				envOr("PASSPORT_PRINCIPAL_MODE", "oidc"), need)
 		}
 		log.Print("WARNING: PASSPORT_DEV_NO_AUTH=1: no principal authentication configured; every proxied request will be denied (development only)")
-		return gateway.Pipeline{}, ks, nil, nil
+		return gateway.Pipeline{}, ks, nil, nil, nil
 	}
 
 	// Order: principal -> [instance -> delegation] -> revoke -> policy -> mint. Revoke runs
@@ -254,10 +273,24 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 		log.Print("instance auth + delegation enabled (PASSPORT_WORKLOAD_CA set)")
 	}
 
-	// The operator's authorization rules (FR-16), from a file rather than from Go.
-	pdp, err := buildPDP(reg)
+	// The operator's configuration document, read ONCE: the policy section and the tooldefs
+	// section come out of the same file, and reading it twice would let two halves of one
+	// startup disagree about what it says.
+	file, err := loadConfig()
 	if err != nil {
-		return gateway.Pipeline{}, nil, nil, err
+		return gateway.Pipeline{}, nil, nil, nil, err
+	}
+
+	// The operator's authorization rules (FR-16), from a file rather than from Go.
+	pdp, err := buildPDP(reg, file)
+	if err != nil {
+		return gateway.Pipeline{}, nil, nil, nil, err
+	}
+
+	// Tool-definition pinning (SEC-3). nil unless the file carries a "tooldefs" section.
+	drift, err := buildToolDefs(reg, file)
+	if err != nil {
+		return gateway.Pipeline{}, nil, nil, nil, err
 	}
 
 	// The human-in-the-loop approver a review is routed to. It is always wired: passing nil
@@ -267,7 +300,7 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 	// rather than by the feature being unreachable, and the timeout is the operator's to set.
 	timeout, err := approvalTimeout()
 	if err != nil {
-		return gateway.Pipeline{}, nil, nil, err
+		return gateway.Pipeline{}, nil, nil, nil, err
 	}
 	approver := policy.NewManualApprover(timeout)
 
@@ -287,8 +320,58 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 	// the nil extractor's empty action. Turning it on makes attenuation live — the stage
 	// intersects the requested tool with the delegated grant and denies anything outside it —
 	// which is why it lands together with the buffering rather than before it.
+	// tooldefs.Stage sits ahead of the policy stage rather than at the head of the pipeline, so
+	// that a request refused for drift is still attributed to the principal and agent that made
+	// it in the audit log. It does nothing at all until a server has been caught drifting.
+	if drift != nil {
+		stages = append(stages, drift.Stage())
+	}
 	stages = append(stages, revoke.Stage(ks), policy.Stage(pdp, policy.MCPActions, approver), mint)
-	return gateway.Pipeline{Stages: stages}, ks, approver, nil
+	return gateway.Pipeline{Stages: stages}, ks, approver, drift, nil
+}
+
+// loadConfig reads the configuration document (PASSPORT_POLICY_FILE), returning nil when none
+// is configured. A file that does not parse or does not validate is a startup error, never a
+// partial load: a gateway running on half a configuration is worse than one that did not start.
+func loadConfig() (*config.File, error) {
+	path := strings.TrimSpace(os.Getenv("PASSPORT_POLICY_FILE"))
+	if path == "" {
+		return nil, nil
+	}
+	return config.Load(path)
+}
+
+// buildToolDefs compiles the "tooldefs" section into the guard the gateway runs (SEC-3).
+// Returning nil is the normal case: pinning is opt-in, and a deployment that has not approved
+// any tool surface gets no response inspection at all.
+func buildToolDefs(reg *gateway.Registry, file *config.File) (*tooldefs.Guard, error) {
+	if file == nil || file.Tooldefs == nil {
+		return nil, nil
+	}
+	cfg := file.Tooldefs
+	guard, err := cfg.Guard()
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range cfg.Warnings() {
+		log.Printf("WARNING: tooldefs: %s", w)
+	}
+	var pinned int
+	for _, id := range cfg.ServerIDs() {
+		if _, ok := reg.Lookup(id); !ok {
+			log.Printf("WARNING: tooldefs: server %q is not registered (PASSPORT_SERVERS); its pin has no effect", id)
+		}
+		if note := cfg.Servers[id].Note; note != "" {
+			log.Printf("tooldefs: server %q: %s", id, note)
+		}
+		if cfg.Servers[id].Fingerprint != "" {
+			pinned++
+			log.Printf("tooldefs: server %q pinned to %s, on drift: %s", id, cfg.Servers[id].Fingerprint, cfg.Mode(id))
+		}
+	}
+	log.Printf("tooldefs: watching %d server(s), %d pinned; tools/list responses are checked against their approved fingerprint (SEC-3)",
+		len(cfg.Servers), pinned)
+	return guard, nil
 }
 
 // buildPDP selects the policy decision point. There are three configurations and the default
@@ -305,7 +388,9 @@ func buildPipeline(ctx context.Context, signer sts.Signer, reg *gateway.Registry
 // The two are mutually exclusive rather than ordered. Whichever won, the other would be a
 // setting an operator believes is in force and is not — and with allow-all winning, a
 // carefully written policy file would be silently ignored.
-func buildPDP(reg *gateway.Registry) (policy.PDP, error) {
+//
+// file is the already-loaded document (nil when PASSPORT_POLICY_FILE is unset).
+func buildPDP(reg *gateway.Registry, file *config.File) (policy.PDP, error) {
 	path := strings.TrimSpace(os.Getenv("PASSPORT_POLICY_FILE"))
 	allowAll := os.Getenv("PASSPORT_ALLOW_ALL") == "1"
 
@@ -320,16 +405,12 @@ func buildPDP(reg *gateway.Registry) (policy.PDP, error) {
 			return types.Decision{Effect: types.EffectAllow, Reason: "allow-all (dev)"}, nil
 		}), nil
 
-	case path == "":
+	case file == nil:
 		log.Print("no PASSPORT_POLICY_FILE set: deny-by-default, every proxied request is denied " +
 			"(point it at a policy file to authorize anything)")
 		return policy.DenyAll, nil
 	}
 
-	file, err := config.Load(path)
-	if err != nil {
-		return nil, err
-	}
 	cfg := file.Policy
 	for _, w := range cfg.Warnings() {
 		log.Printf("WARNING: policy: %s", w)

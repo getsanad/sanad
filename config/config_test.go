@@ -9,6 +9,7 @@ import (
 
 	"github.com/getsanad/sanad/pkg/types"
 	"github.com/getsanad/sanad/policy"
+	"github.com/getsanad/sanad/tooldefs"
 )
 
 // A realistic policy file, comments and all — "note" being where the comments go, since JSON
@@ -159,6 +160,116 @@ func TestParseSurfacesWarningsWithoutFailing(t *testing.T) {
 	}
 	if w := file.Policy.Warnings(); len(w) != 1 {
 		t.Fatalf("warnings = %v, want one about the missing methods", w)
+	}
+}
+
+// --- the tooldefs section (SEC-3) -----------------------------------------------------
+
+// TestToolDefsSectionLoads: pins arrive through the SAME versioned, sectioned document as the
+// policy rules, decoded by the same strict decoder — not through a second configuration
+// mechanism an operator has to learn and a deployment has to mount separately.
+func TestToolDefsSectionLoads(t *testing.T) {
+	path := write(t, "config.json", `{
+	  "version": 1,
+	  "policy": {"servers": {"github": {"allow": {"methods": ["tools/list"], "tools": ["read"]}}}},
+	  "tooldefs": {
+	    "note": "pins reviewed with each vendor release",
+	    "servers": {
+	      "github":  {"note": "approved 2026-07-01 by @security", "fingerprint": "sha256:`+strings.Repeat("ab", 32)+`"},
+	      "staging": {"on_drift": "warn", "fingerprint": "sha256:`+strings.Repeat("cd", 32)+`"}
+	    }
+	  }
+	}`)
+
+	file, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if file.Tooldefs == nil {
+		t.Fatal("the tooldefs section was dropped")
+	}
+	if file.Tooldefs.Note == "" || file.Tooldefs.Servers["github"].Note == "" {
+		t.Fatal("notes are parsed, not dropped: a bare 64-hex pin is the least self-explanatory thing in the file")
+	}
+	if got := file.Tooldefs.Mode("github"); got != tooldefs.ModeDeny {
+		t.Fatalf("github on_drift = %q, want the deny default", got)
+	}
+	if got := file.Tooldefs.Mode("staging"); got != tooldefs.ModeWarn {
+		t.Fatalf("staging on_drift = %q, want the per-server override", got)
+	}
+
+	guard, err := file.Tooldefs.Guard()
+	if err != nil || guard == nil {
+		t.Fatalf("the section must compile into the runtime check: %v", err)
+	}
+	if !guard.Watches("github") || guard.Watches("elsewhere") {
+		t.Fatal("the guard watches exactly the servers the file names")
+	}
+}
+
+// TestToolDefsSectionIsOptional: absent means the check is off, which is a legal deployment —
+// unlike an absent policy section, which is a mistake.
+func TestToolDefsSectionIsOptional(t *testing.T) {
+	file, err := Parse([]byte(example), "test.json")
+	if err != nil {
+		t.Fatalf("a document with no tooldefs section must load: %v", err)
+	}
+	if file.Tooldefs != nil {
+		t.Fatal("an absent section must stay absent, not become an empty one")
+	}
+	guard, err := file.Tooldefs.Guard()
+	if err != nil || guard != nil {
+		t.Fatalf("no section, no guard: %v (%v)", guard, err)
+	}
+}
+
+// TestToolDefsSectionValidatesWithTheFileName: a pin an operator mistyped must stop startup
+// pointing at the file and the entry, exactly like a broken policy rule.
+func TestToolDefsSectionValidatesWithTheFileName(t *testing.T) {
+	policySection := `"policy":{"servers":{"github":{"allow":{"tools":["read"]}}}}`
+	cases := []struct {
+		name string
+		doc  string
+		want []string
+	}{
+		{
+			name: "mistyped fingerprint",
+			doc:  `{"version":1,` + policySection + `,"tooldefs":{"servers":{"github":{"fingerprint":"sha256:oops"}}}}`,
+			want: []string{"config test.json", `server "github"`, "hex"},
+		},
+		{
+			name: "truncated fingerprint",
+			doc:  `{"version":1,` + policySection + `,"tooldefs":{"servers":{"github":{"fingerprint":"sha256:abcdef"}}}}`,
+			want: []string{"config test.json", `server "github"`, "64 hex characters"},
+		},
+		{
+			name: "unknown failure mode",
+			doc:  `{"version":1,` + policySection + `,"tooldefs":{"servers":{"github":{"on_drift":"page-me"}}}}`,
+			want: []string{"config test.json", "on_drift", `"deny"`},
+		},
+		{
+			name: "present but empty",
+			doc:  `{"version":1,` + policySection + `,"tooldefs":{"servers":{}}}`,
+			want: []string{"no servers configured"},
+		},
+		{
+			name: "misspelled key inside the section",
+			doc:  `{"version":1,` + policySection + `,"tooldefs":{"servers":{"github":{"fingerprints":"sha256:x"}}}}`,
+			want: []string{`unknown field "fingerprints"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.doc), "test.json")
+			if err == nil {
+				t.Fatal("want an error, got nil")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"sync"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // A Witness is an independent party that co-signs the operator's log checkpoints (PRD
@@ -64,11 +66,13 @@ func (w *Witness) Witness(cp SignedCheckpoint, consistency [][]byte) (WitnessSig
 	return WitnessSignature{
 		KeyID:     w.kid,
 		Size:      cp.Size,
-		Signature: ed25519.Sign(w.priv, checkpointMsg(cp)),
+		Signature: sigctx.Sign(sigctx.AuditWitness, w.priv, checkpointMsg(cp)),
 	}, nil
 }
 
-// VerifyWitness checks a witness co-signature over a checkpoint.
+// VerifyWitness checks a witness co-signature over a checkpoint. The co-signature is made
+// under its own context, so the operator cannot present its own checkpoint signature as
+// independent corroboration — the point of a witness is that someone else signed.
 func VerifyWitness(witnessPub ed25519.PublicKey, cp SignedCheckpoint, ws WitnessSignature) bool {
-	return ws.Size == cp.Size && ed25519.Verify(witnessPub, checkpointMsg(cp), ws.Signature)
+	return ws.Size == cp.Size && sigctx.Verify(sigctx.AuditWitness, witnessPub, checkpointMsg(cp), ws.Signature)
 }

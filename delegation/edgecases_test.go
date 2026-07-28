@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -317,7 +318,7 @@ func TestContinuityBreakDelegatorMismatch(t *testing.T) {
 	// Rewrite hop 2's delegator to a1 (it should be a2). Re-sign with a1's key so the
 	// signature itself is valid, isolating the continuity check.
 	chain.Hops[2].Delegator = a1.id
-	chain.Hops[2].Signature = ed25519.Sign(a1.priv,
+	chain.Hops[2].Signature = sigctx.Sign(sigctx.DelegationHop, a1.priv,
 		canonical(a1.id, chain.Hops[2].Delegate, chain.Hops[2].Grant, chain.Hops[1].Signature))
 
 	if _, _, err := Verify(chain, keys, principal.id, time.Now()); err == nil {

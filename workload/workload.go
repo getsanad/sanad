@@ -23,6 +23,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // DefaultTTL is the credential lifetime when none is configured. Short by design (FR-4).
@@ -74,6 +76,12 @@ func (a *TokenAttestor) Register(token, agentID string) {
 // bootstrap token, over the authority-issued nonce and the public key being enrolled. The
 // token stays on the client, and the result only enrolls that key against that nonce.
 //
+// It carries its context label as a JSON member rather than going through sigctx.Message:
+// this is a MAC keyed by the bootstrap token, which is never an Ed25519 key and so shares no
+// message space with any signature here, and the JSON encoding is already unambiguous — the
+// label sits in its own quoted field and cannot absorb bytes from nonce or pub. Keeping it as
+// it is also keeps the SDK enrollment vectors stable.
+//
 // The token is still a shared secret whose holder can enroll at will — making bootstrap
 // tokens single-use and expiring is a separate item; this only stops a captured enrollment
 // from being replayed with someone else's key.
@@ -82,7 +90,7 @@ func BootstrapEvidence(token string, nonce []byte, pub ed25519.PublicKey) []byte
 		Ctx   string `json:"ctx"`
 		Nonce []byte `json:"nonce"`
 		Pub   []byte `json:"pub"`
-	}{"sanad/bootstrap-evidence/v1", nonce, pub})
+	}{sigctx.BootstrapEvidence, nonce, pub})
 	m := hmac.New(sha256.New, []byte(token))
 	m.Write(msg)
 	return m.Sum(nil)
@@ -220,7 +228,7 @@ func (a *Authority) Issue(evidence, nonce []byte, pubKey ed25519.PublicKey) (Cre
 		NotAfter:  now.Add(a.ttl),
 		KeyID:     a.kid,
 	}
-	c.Signature = ed25519.Sign(a.caPriv, canonical(c))
+	c.Signature = sigctx.Sign(sigctx.WorkloadCredential, a.caPriv, canonical(c))
 	return c, nil
 }
 
@@ -232,7 +240,7 @@ func Verify(caPub ed25519.PublicKey, c Credential, now time.Time) error {
 	if len(c.PublicKey) != ed25519.PublicKeySize {
 		return errors.New("workload: credential has invalid public key")
 	}
-	if !ed25519.Verify(caPub, canonical(c), c.Signature) {
+	if !sigctx.Verify(sigctx.WorkloadCredential, caPub, canonical(c), c.Signature) {
 		return errors.New("workload: bad credential signature")
 	}
 	if now.Before(c.IssuedAt) {

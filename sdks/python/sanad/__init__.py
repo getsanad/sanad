@@ -9,6 +9,10 @@ Wire formats match the Go implementation byte-for-byte. All base64 is RFC 4648
 URL-safe with NO padding (Go's ``base64.RawURLEncoding``). Cryptography is
 Ed25519.
 
+Every signature is domain-separated: it is made over
+``uint64be(len(ctx)) || ctx || message``, where ``ctx`` names what is being signed
+(see :func:`sigctx_message`). Signing the bare message is not accepted by the gateway.
+
 Enrolling is two requests: the agent fetches a single-use nonce from the authority,
 then presents attestation evidence that covers both that nonce and the public key it
 is enrolling. That binding is what stops an enrollment captured off the wire from
@@ -43,6 +47,8 @@ __all__ = [
     "generate_instance_key",
     "public_key_of",
     "proof",
+    "sigctx_message",
+    "CTX_INSTANCE_PROOF",
     "bootstrap_evidence",
     "request_nonce",
     "enroll",
@@ -63,6 +69,9 @@ HEADER_DELEGATION = "X-Agent-Delegation"  # delegation/transport.go: HeaderDeleg
 _SEED_SIZE = 32
 _PUB_SIZE = 32
 _PRIV64_SIZE = 64  # seed(32) || public(32), matching Go's ed25519.PrivateKey
+
+# Context label for an instance proof of possession (Go's ``sigctx.InstanceProof``).
+CTX_INSTANCE_PROOF = "sanad/instance-proof/v1"
 
 
 class PassportError(Exception):
@@ -148,14 +157,34 @@ def public_key_of(private_key: str) -> str:
     return _b64url_encode(_public_raw(_load_private(private_key)))
 
 
+def sigctx_message(ctx: str, message: bytes) -> bytes:
+    """Build the domain-separated signing input Go's ``sigctx.Message`` produces.
+
+    ``uint64be(len(ctx)) || utf8(ctx) || message``.
+
+    The 8-byte big-endian length prefix is what makes the encoding unambiguous: it fixes
+    exactly where the label ends, so the bytes parse back to one ``(ctx, message)`` pair
+    and no label can be read as the head of a message. The instance key signs more than
+    one kind of thing (it proves possession here, and authenticates the delegation hops
+    the agent signs), and the label is what keeps a signature made for one from being
+    accepted as the other.
+    """
+    label = ctx.encode("utf-8")
+    return len(label).to_bytes(8, "big") + label + message
+
+
 def proof(private_key: str, principal_token: str) -> str:
-    """Produce the proof of possession: base64url(Ed25519_sign(priv, utf8(principal_token))).
+    """Produce the proof of possession sent as ``X-Agent-Proof``.
+
+    ``base64url(Ed25519_sign(priv, sigctx_message(CTX_INSTANCE_PROOF, utf8(token))))``.
 
     Mirrors ``workload.Proof`` in the Go code and binds the instance key to the
-    specific short-lived principal token.
+    specific short-lived principal token. Signing the bare token — as this SDK did
+    before the context was introduced — turns the instance key into a signing oracle
+    for anything else that key authenticates, so the gateway rejects such a signature.
     """
     priv = _load_private(private_key)
-    sig = priv.sign(principal_token.encode("utf-8"))
+    sig = priv.sign(sigctx_message(CTX_INSTANCE_PROOF, principal_token.encode("utf-8")))
     return _b64url_encode(sig)
 
 

@@ -82,7 +82,7 @@ client sets:
 | --- | --- |
 | `Authorization` | `Bearer <principal_token>` (you supply the opaque token) |
 | `X-Agent-Credential` | base64url(utf8(credential JSON text)) — encoded verbatim, never re-serialized |
-| `X-Agent-Proof` | base64url(Ed25519_sign(instance_priv, utf8(principal_token))) |
+| `X-Agent-Proof` | base64url(Ed25519_sign(instance_priv, sigctx_message("sanad/instance-proof/v1", utf8(principal_token)))) |
 | `X-Agent-Delegation` | base64url(utf8(delegation chain text)) — only if a delegation chain was provided |
 
 The credential's embedded signature would break if the JSON were re-serialized, so
@@ -93,6 +93,13 @@ the SDK encodes the **exact bytes** returned by enrollment.
 - `generate_instance_key() -> dict` — `{"private_key": base64url(seed||pub), "public_key": base64url(pub)}`.
 - `public_key_of(private_key: str) -> str` — accepts a 32-byte seed or 64-byte `seed||pub` (base64url).
 - `proof(private_key: str, principal_token: str) -> str`.
+- `sigctx_message(ctx: str, message: bytes) -> bytes` — the domain-separated signing input
+  Go's `sigctx.Message` produces: `uint64be(len(ctx)) || utf8(ctx) || message`. Every
+  signature commits to a context label saying what it is, because the instance key signs
+  more than one kind of thing — it proves possession here and authenticates the delegation
+  hops the agent signs. The 8-byte length prefix fixes exactly where the label ends, so a
+  signature made for one purpose cannot verify for another. **Signing the bare token is
+  rejected by the gateway.**
 - `bootstrap_evidence(bootstrap_token, nonce: bytes, public_key: bytes) -> bytes` — the
   attestation evidence a Go `workload.TokenAttestor` accepts: HMAC-SHA256 keyed by the
   bootstrap token over the nonce and the key being enrolled. The token never leaves the

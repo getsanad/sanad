@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 func witnessKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -111,7 +113,7 @@ func TestWitnessRejectsShrink(t *testing.T) {
 
 	// A checkpoint claiming a smaller size must be refused.
 	smaller := SignedCheckpoint{Size: 2, Root: Root(nil), KeyID: "ckpt-1"}
-	smaller.Signature = ed25519.Sign(log.signer, checkpointMsg(smaller))
+	smaller.Signature = sigctx.Sign(sigctx.AuditCheckpoint, log.signer, checkpointMsg(smaller))
 	if _, err := w.Witness(smaller, nil); err == nil {
 		t.Fatal("witness must reject a checkpoint smaller than the last one it saw")
 	}

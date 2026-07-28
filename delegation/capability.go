@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -48,7 +49,7 @@ func NewCapability(rootPriv ed25519.PrivateKey, g Grant) (Capability, ed25519.Pr
 	if err != nil {
 		return Capability{}, nil, err
 	}
-	sig := ed25519.Sign(rootPriv, blockMsg(g, nextPub))
+	sig := sigctx.Sign(sigctx.CapabilityBlock, rootPriv, blockMsg(g, nextPub))
 	return Capability{Blocks: []Block{{Grant: g, NextPub: nextPub, Signature: sig}}}, nextPriv, nil
 }
 
@@ -70,7 +71,7 @@ func (c Capability) Attenuate(holderSecret ed25519.PrivateKey, g Grant) (Capabil
 	if err != nil {
 		return Capability{}, nil, err
 	}
-	sig := ed25519.Sign(holderSecret, blockMsg(g, nextPub))
+	sig := sigctx.Sign(sigctx.CapabilityBlock, holderSecret, blockMsg(g, nextPub))
 	blocks := append(append([]Block(nil), c.Blocks...), Block{Grant: g, NextPub: nextPub, Signature: sig})
 	return Capability{Blocks: blocks}, nextPriv, nil
 }
@@ -89,7 +90,7 @@ func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time) (Grant, err
 		if len(b.NextPub) != ed25519.PublicKeySize {
 			return Grant{}, fmt.Errorf("delegation: block %d has an invalid next key", i)
 		}
-		if !ed25519.Verify(signer, blockMsg(b.Grant, b.NextPub), b.Signature) {
+		if !sigctx.Verify(sigctx.CapabilityBlock, signer, blockMsg(b.Grant, b.NextPub), b.Signature) {
 			return Grant{}, fmt.Errorf("delegation: capability block %d has an invalid signature", i)
 		}
 		if i > 0 {
@@ -107,8 +108,14 @@ func (c Capability) Verify(rootPub ed25519.PublicKey, now time.Time) (Grant, err
 }
 
 // HolderProof signs msg with the holder secret to prove possession of the capability.
+//
+// It is domain-separated from block signatures (sigctx.CapabilityHolderProof vs
+// CapabilityBlock) because the holder secret signs both: it proves possession here and signs
+// the next block in Attenuate. Untagged, proving possession over a caller-supplied msg is a
+// signing oracle for blocks — feed it the bytes of blockMsg and the proof comes back as a
+// valid attenuation, letting whoever chose msg re-point the capability at their own key.
 func HolderProof(holderSecret ed25519.PrivateKey, msg []byte) []byte {
-	return ed25519.Sign(holderSecret, msg)
+	return sigctx.Sign(sigctx.CapabilityHolderProof, holderSecret, msg)
 }
 
 // VerifyHolder checks a holder proof over msg against the capability's final next-key.
@@ -116,7 +123,7 @@ func (c Capability) VerifyHolder(msg, proof []byte) bool {
 	if len(c.Blocks) == 0 {
 		return false
 	}
-	return ed25519.Verify(c.Blocks[len(c.Blocks)-1].NextPub, msg, proof)
+	return sigctx.Verify(sigctx.CapabilityHolderProof, c.Blocks[len(c.Blocks)-1].NextPub, msg, proof)
 }
 
 // EncodeCapability serializes a capability for transport.

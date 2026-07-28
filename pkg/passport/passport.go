@@ -5,6 +5,19 @@
 // The algorithm is pinned to Ed25519. The token's `alg` header is validated for hygiene
 // but is NEVER used to select a verification algorithm — Ed25519 is always used — so
 // `alg:none` and RS256↔HS256 confusion attacks are impossible by construction.
+//
+// Domain separation. Every other signature in Sanad is tagged with an explicit context label
+// (internal/sigctx); the passport deliberately is not, because it is already separated twice
+// over and wrapping it would break the JWS. Structurally, the signing input is a JWS with an
+// explicit type — `typ:"passport+jwt"` — which Verify enforces, the explicit-typing defence
+// RFC 8725 §3.11 prescribes for exactly this problem; a signature over some other JWT cannot
+// be a passport, because its header decodes to a different typ. Encoding-wise, a JWS signing
+// input is ASCII base64url with a '.' separator, while a sigctx input begins with an 8-byte
+// big-endian length whose leading bytes are NUL — no byte string is both, so the two spaces
+// are disjoint and a passport signature can never be replayed as a delegation hop, capability
+// block or checkpoint (or the reverse). Adding a sigctx wrapper here would buy nothing and
+// would make passports unverifiable by the standard JOSE libraries the MCP servers that
+// verify them offline are expected to use.
 package passport
 
 import (

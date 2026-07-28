@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // Token is a centrally-issued delegation token (PRD FR-12a). Unlike the offline Capability,
@@ -84,7 +86,7 @@ func (a *ExchangeAuthority) issue(parentID, principal, subject string, g Grant) 
 		ID: id, ParentID: parentID, Principal: principal, Subject: subject,
 		Grant: g, IssuedAt: now, NotAfter: now.Add(a.ttl), KeyID: a.kid,
 	}
-	t.Signature = ed25519.Sign(a.priv, tokenMsg(t))
+	t.Signature = sigctx.Sign(sigctx.ExchangeToken, a.priv, tokenMsg(t))
 
 	a.mu.Lock()
 	a.parent[id] = parentID
@@ -95,7 +97,7 @@ func (a *ExchangeAuthority) issue(parentID, principal, subject string, g Grant) 
 // Verify checks the token's signature and validity window, and that neither it nor any
 // ancestor has been revoked (centralized mid-chain revocation).
 func (a *ExchangeAuthority) Verify(t Token, now time.Time) error {
-	if !ed25519.Verify(a.PublicKey(), tokenMsg(t), t.Signature) {
+	if !sigctx.Verify(sigctx.ExchangeToken, a.PublicKey(), tokenMsg(t), t.Signature) {
 		return errors.New("delegation: invalid token signature")
 	}
 	if !t.NotAfter.IsZero() && !now.Before(t.NotAfter) {

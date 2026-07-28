@@ -74,8 +74,18 @@ Return the base64url 32-byte public key for an instance private key. Accepts eit
 32-byte seed or a 64-byte `seed||pub` key (uses the first 32 bytes as the seed).
 
 ### `proof(privateKey: string, principalToken: string): string`
-base64url of the Ed25519 signature, made with the instance key, over the UTF-8 bytes
-of the principal token. This is the proof-of-possession sent as `X-Agent-Proof`.
+base64url of the Ed25519 signature, made with the instance key, over
+`sigctxMessage('sanad/instance-proof/v1', utf8(principalToken))`. This is the
+proof-of-possession sent as `X-Agent-Proof`.
+
+### `sigctxMessage(ctx: string, message): Buffer`
+The domain-separated signing input Go's `sigctx.Message` produces:
+`uint64be(ctx.length) || utf8(ctx) || message`. Every signature in Sanad commits to a
+context label saying what it is, because the instance key signs more than one kind of
+thing — it proves possession here and authenticates the delegation hops the agent
+signs. The 8-byte length prefix fixes exactly where the label ends, so the bytes parse
+back to one `(ctx, message)` pair and a signature made for one purpose cannot verify
+for another. **Signing the bare token is rejected by the gateway.**
 
 ### `bootstrapEvidence(bootstrapToken, nonce, publicKey): Buffer`
 The attestation evidence a Go `workload.TokenAttestor` accepts: HMAC-SHA256, keyed by
@@ -103,7 +113,7 @@ Constructed with `{ gatewayUrl, instanceKey, credential, delegation?, fetch? }`.
 - `headers(principalToken): Record<string,string>` — builds the passport headers:
   - `Authorization: Bearer <principalToken>`
   - `X-Agent-Credential: base64url(utf8(credential))`
-  - `X-Agent-Proof: base64url(ed25519_sign(instanceKey, utf8(principalToken)))`
+  - `X-Agent-Proof: base64url(ed25519_sign(instanceKey, sigctxMessage('sanad/instance-proof/v1', utf8(principalToken))))`
   - `X-Agent-Delegation: base64url(utf8(delegation))` — **only** when a delegation
     chain was provided.
 - `url(serverId, path): string` — `${gatewayUrl}/servers/${serverId}${path}`.

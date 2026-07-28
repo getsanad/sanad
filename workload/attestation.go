@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/getsanad/sanad/internal/sigctx"
 )
 
 // MeasuredAttestor is a RATS-style attestor for the high-assurance tier (PRD FR-26, P3-01).
@@ -99,7 +101,7 @@ func SignQuote(attKey ed25519.PrivateKey, agentID, measurement string, nonce []b
 		Confirm:     confirmKey(pub),
 		IssuedAt:    issuedAt.UTC(),
 	}
-	q.Signature = ed25519.Sign(attKey, quoteMsg(q))
+	q.Signature = sigctx.Sign(sigctx.AttestationQuote, attKey, quoteMsg(q))
 	return json.Marshal(q)
 }
 
@@ -111,7 +113,7 @@ func (m *MeasuredAttestor) Attest(evidence, nonce []byte, pubKey ed25519.PublicK
 	if err := json.Unmarshal(evidence, &q); err != nil {
 		return "", fmt.Errorf("workload: bad attestation evidence: %w", err)
 	}
-	if !ed25519.Verify(m.attKey, quoteMsg(q), q.Signature) {
+	if !sigctx.Verify(sigctx.AttestationQuote, m.attKey, quoteMsg(q), q.Signature) {
 		return "", errors.New("workload: attestation quote signature invalid")
 	}
 	if subtle.ConstantTimeCompare(q.Nonce, nonce) != 1 {

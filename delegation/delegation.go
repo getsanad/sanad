@@ -16,6 +16,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/getsanad/sanad/internal/sigctx"
 	"github.com/getsanad/sanad/pkg/types"
 )
 
@@ -71,7 +72,7 @@ func NewRoot(principalKey ed25519.PrivateKey, principalID, delegateID string, g 
 	if len(principalKey) != ed25519.PrivateKeySize {
 		return Chain{}, errors.New("delegation: invalid principal key")
 	}
-	sig := ed25519.Sign(principalKey, canonical(principalID, delegateID, g, nil))
+	sig := sigctx.Sign(sigctx.DelegationHop, principalKey, canonical(principalID, delegateID, g, nil))
 	return Chain{Hops: []Hop{{Delegator: principalID, Delegate: delegateID, Grant: g, Signature: sig}}}, nil
 }
 
@@ -86,7 +87,7 @@ func (c Chain) Extend(holderKey ed25519.PrivateKey, delegateID string, g Grant) 
 		return Chain{}, errors.New("delegation: invalid holder key")
 	}
 	last := c.Hops[len(c.Hops)-1]
-	sig := ed25519.Sign(holderKey, canonical(last.Delegate, delegateID, g, last.Signature))
+	sig := sigctx.Sign(sigctx.DelegationHop, holderKey, canonical(last.Delegate, delegateID, g, last.Signature))
 	hops := append(append([]Hop(nil), c.Hops...), Hop{
 		Delegator: last.Delegate, Delegate: delegateID, Grant: g, Signature: sig,
 	})
@@ -106,7 +107,10 @@ func (c Chain) ToTypes() *types.DelegationChain {
 }
 
 // canonical is the deterministic signing input for a hop. Tools/Servers are sorted so the
-// encoding does not depend on caller ordering.
+// encoding does not depend on caller ordering. Callers sign and verify it under
+// sigctx.DelegationHop: the delegator's key also signs other things (an agent's instance key
+// is its proof of possession; a principal's key can root a capability), and only the context
+// label keeps a signature made there from being replayed as a hop.
 func canonical(delegator, delegate string, g Grant, prevSig []byte) []byte {
 	tools := append([]string(nil), g.Tools...)
 	sort.Strings(tools)

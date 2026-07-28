@@ -10,9 +10,17 @@ import (
 	"github.com/getsanad/sanad/pkg/types"
 )
 
-// toolIs is a fixed extractor: one requested tool, i.e. one decision.
-func toolIs(name string) ToolExtractor {
-	return func(*gateway.Request) []string { return []string{name} }
+// toolIs is a fixed extractor: one tools/call for the named tool, i.e. one decision.
+func toolIs(name string) ActionExtractor {
+	return func(*gateway.Request) []Action {
+		return []Action{{Method: "tools/call", Tool: name}}
+	}
+}
+
+// methodIs is a fixed extractor for a message that names no tool: initialize, tools/list, a
+// notification — the traffic AllowList matches in its method namespace.
+func methodIs(name string) ActionExtractor {
+	return func(*gateway.Request) []Action { return []Action{{Method: name}} }
 }
 
 func authedReq(server string) *gateway.Request {

@@ -10,34 +10,42 @@ import (
 	"github.com/getsanad/sanad/pkg/types"
 )
 
-// ToolExtractor derives the tools an in-flight request asks for: ONE ENTRY PER DECISION the
-// request requires, not per distinct tool. For MCP that is one entry per JSON-RPC message in
-// the body — "" for a message that invokes no tool of its own (initialize, tools/list, a
-// notification) — so a batch is decided element by element rather than on its first element.
-// Returning nil, like a nil extractor, yields a single decision with an empty tool (which a
-// "*" allowlist still permits) and leaves any delegated scope on the request untouched.
-// MCPTools is the default; deployments can supply their own.
-type ToolExtractor func(req *gateway.Request) []string
+// Action is one unit of authorization: the JSON-RPC method a request element invokes, and the
+// tool it names (empty for every method but tools/call, because no other method names one).
+// Both travel to the PDP, so a policy can allow "tools/list" while gating "tools/call".
+type Action struct {
+	Method string
+	Tool   string
+}
 
-// MCPTools is the default ToolExtractor. It projects the JSON-RPC messages the gateway parsed
-// out of the request body (gateway.Request.Calls) onto the tool each one invokes: a tools/call
-// contributes its params.name, every other method contributes "".
+// ActionExtractor derives the actions an in-flight request asks for: ONE ENTRY PER DECISION the
+// request requires, not per distinct tool. For MCP that is one entry per JSON-RPC message in
+// the body — with an empty Tool for a message that invokes no tool of its own (initialize,
+// tools/list, a notification) — so a batch is decided element by element rather than on its
+// first element. Returning nil, like a nil extractor, yields a single decision for MethodNone
+// and leaves any delegated scope on the request untouched. MCPActions is the default;
+// deployments can supply their own.
+type ActionExtractor func(req *gateway.Request) []Action
+
+// MCPActions is the default ActionExtractor. It projects the JSON-RPC messages the gateway
+// parsed out of the request body (gateway.Request.Calls) onto the action each one takes: its
+// method, plus the tool a tools/call names in params.name.
 //
-// Protocol methods deliberately map to "" rather than to their method name. Scope.Tools is the
-// namespace a delegation chain is signed over, and it names MCP tools; folding "initialize" and
-// "tools/list" into it would mean every chain had to grant the protocol handshake alongside the
-// work, and a chain attenuated to ["read"] could never open a session at all. They are still
-// decided — once each, with an empty tool, exactly as a bodyless request is — so an operator
-// policy that wants to gate them can, via the method on Request.Calls.
-var MCPTools ToolExtractor = func(req *gateway.Request) []string {
+// Protocol methods deliberately contribute NO tool rather than their method name as one.
+// Scope.Tools is the namespace a delegation chain is signed over, and it names MCP tools;
+// folding "initialize" and "tools/list" into it would mean every chain had to grant the
+// protocol handshake alongside the work, and a chain attenuated to ["read"] could never open a
+// session at all. They are still decided — once each — and now under their own method, so an
+// operator policy that wants to gate them can (see AllowList's two namespaces).
+var MCPActions ActionExtractor = func(req *gateway.Request) []Action {
 	if req == nil || len(req.Calls) == 0 {
 		return nil
 	}
-	tools := make([]string, len(req.Calls))
+	actions := make([]Action, len(req.Calls))
 	for i, c := range req.Calls {
-		tools[i] = c.Tool
+		actions[i] = Action{Method: c.Method, Tool: c.Tool}
 	}
-	return tools
+	return actions
 }
 
 // Stage returns the gateway policy stage. It builds the PDP input from the verified
@@ -61,37 +69,38 @@ var MCPTools ToolExtractor = func(req *gateway.Request) []string {
 // confused-deputy problem the passport exists to prevent. Every element is evaluated, including
 // repeats of the same tool, so a stateful PDP (budgets, rate limits) counts what was actually
 // asked for and an approver is asked about each invocation rather than about a set.
-func Stage(pdp PDP, extract ToolExtractor, approver Approver) gateway.Stage {
+func Stage(pdp PDP, extract ActionExtractor, approver Approver) gateway.Stage {
 	return gateway.NewStage("policy", func(ctx context.Context, req *gateway.Request) error {
 		if req.Principal == nil {
 			return errors.New("policy: no authenticated principal")
 		}
 
-		var tools []string
+		var actions []Action
 		if extract != nil {
-			tools = extract(req)
+			actions = extract(req)
 		}
 		// Whatever the delegation stage narrowed the request to (P2-04): the effective
 		// grant's scope, or the zero Scope when the principal acts directly.
 		delegated := req.Scope
 
-		// A request that names no tool at all — a GET, a non-JSON-RPC body, no extractor — still
-		// gets exactly one decision, with an empty tool, which is the behaviour that predates
-		// body parsing. It is one decision, never zero: a request nobody decided is a request
-		// nobody authorized.
-		decide := tools
+		// A request that carries no JSON-RPC call at all — a GET, a non-JSON-RPC body, no
+		// extractor — still gets exactly one decision, under MethodNone so that an operator can
+		// name it in a policy. It is one decision, never zero: a request nobody decided is a
+		// request nobody authorized.
+		decide := actions
 		if len(decide) == 0 {
-			decide = []string{""}
+			decide = []Action{{Method: MethodNone}}
 		}
-		for _, tool := range decide {
+		for _, act := range decide {
 			// The attenuation floor, enforced before the PDP is consulted so that no policy — and
 			// no human approver — is ever asked to bless authority the chain does not contain.
-			if tool != "" && !granted(delegated.Tools, tool) {
-				return deny(req, fmt.Sprintf("tool %q is outside the delegated scope %v", tool, delegated.Tools))
+			if act.Tool != "" && !granted(delegated.Tools, act.Tool) {
+				return deny(req, fmt.Sprintf("tool %q is outside the delegated scope %v", act.Tool, delegated.Tools))
 			}
 
 			in := Input{
-				Principal: req.Principal, Agent: req.Agent, Server: req.Server, Tool: tool,
+				Principal: req.Principal, Agent: req.Agent, Server: req.Server,
+				Method: act.Method, Tool: act.Tool,
 				Delegation: req.Delegation, DelegatedScope: delegated,
 			}
 
@@ -114,7 +123,7 @@ func Stage(pdp PDP, extract ToolExtractor, approver Approver) gateway.Stage {
 			}
 		}
 
-		if requested := distinct(tools); len(requested) > 0 {
+		if requested := distinct(actions); len(requested) > 0 {
 			// Narrow to the tools actually requested — each already established to be within the
 			// grant, so this can only shrink it — and carry the delegated Budget through, since
 			// it is signed authority the request has no standing to drop.
@@ -126,12 +135,12 @@ func Stage(pdp PDP, extract ToolExtractor, approver Approver) gateway.Stage {
 
 // distinct returns the non-empty tool names in order, without repeats. Decisions are made per
 // element, but the scope minted from them is a set: a batch calling "read" twice is authority
-// over "read", and the empty entries the protocol methods contribute are not tools at all.
-func distinct(tools []string) []string {
-	out := make([]string, 0, len(tools))
-	for _, t := range tools {
-		if t != "" && !slices.Contains(out, t) {
-			out = append(out, t)
+// over "read", and the protocol methods, which name no tool, contribute nothing to it.
+func distinct(actions []Action) []string {
+	out := make([]string, 0, len(actions))
+	for _, a := range actions {
+		if a.Tool != "" && !slices.Contains(out, a.Tool) {
+			out = append(out, a.Tool)
 		}
 	}
 	return out

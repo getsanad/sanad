@@ -134,7 +134,7 @@ func TestLiveInstanceAndDelegation(t *testing.T) {
 
 // TestLiveDelegationBoundsThePolicyStage drives the same vertical over REAL MCP traffic: a
 // streamable-HTTP POST whose JSON-RPC body names the tool, the gateway buffering and parsing
-// it, and policy.MCPTools handing it to the policy stage (FR-16).
+// it, and policy.MCPActions handing it to the policy stage (FR-16).
 //
 // Two things are pinned at once. The policy stage used to ASSIGN types.Scope{Tools: {tool}},
 // so wiring a real extractor would have silently replaced the attenuated grant: a chain
@@ -206,7 +206,7 @@ func TestLiveDelegationBoundsThePolicyStage(t *testing.T) {
 			stubPrincipal,
 			workload.InstanceStage(caPub, store),
 			delegation.Stage(store, delegation.HeaderExtractor(delegation.HeaderDelegation)),
-			policy.Stage(allowAll, policy.MCPTools, nil),
+			policy.Stage(allowAll, policy.MCPActions, nil),
 			sts.MintStage(sts.New(signer, sts.Config{Issuer: "sanad"})),
 		}}}
 	}

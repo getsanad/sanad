@@ -7,12 +7,15 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/getsanad/sanad/gateway"
 	"github.com/getsanad/sanad/pkg/types"
+	"github.com/getsanad/sanad/policy"
 	"github.com/getsanad/sanad/revoke"
 	"github.com/getsanad/sanad/sts"
 )
@@ -25,6 +28,7 @@ func clearAuthEnv(t *testing.T) {
 		"PASSPORT_PRINCIPAL_MODE", "PASSPORT_OIDC_ISSUER", "PASSPORT_OIDC_CLIENT_ID",
 		"PASSPORT_VC_TRUSTED_ISSUERS", "PASSPORT_WORKLOAD_CA", "PASSPORT_REVOCATION_DSN",
 		"PASSPORT_DEV_NO_AUTH", "PASSPORT_ALLOW_DIRECT_PRINCIPAL",
+		"PASSPORT_POLICY_FILE", "PASSPORT_ALLOW_ALL", "PASSPORT_APPROVAL_TIMEOUT",
 	} {
 		t.Setenv(k, "")
 	}
@@ -41,7 +45,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 
 	t.Run("unconfigured is fatal", func(t *testing.T) {
 		clearAuthEnv(t)
-		_, _, err := buildPipeline(context.Background(), signer)
+		_, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err == nil {
 			t.Fatal("want a startup error with no principal authenticator configured, got nil")
 		}
@@ -56,7 +60,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("vc mode names the vc var", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
-		_, _, err := buildPipeline(context.Background(), signer)
+		_, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err == nil || !strings.Contains(err.Error(), "PASSPORT_VC_TRUSTED_ISSUERS") {
 			t.Fatalf("want an error naming PASSPORT_VC_TRUSTED_ISSUERS, got %v", err)
 		}
@@ -65,7 +69,7 @@ func TestBuildPipelineRequiresPrincipalAuth(t *testing.T) {
 	t.Run("dev escape hatch", func(t *testing.T) {
 		clearAuthEnv(t)
 		t.Setenv("PASSPORT_DEV_NO_AUTH", "1")
-		p, _, err := buildPipeline(context.Background(), signer)
+		p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("PASSPORT_DEV_NO_AUTH=1: %v", err)
 		}
@@ -100,7 +104,7 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 	// delegationStage builds the configured pipeline and returns its delegation stage.
 	delegationStage := func(t *testing.T) gateway.Stage {
 		t.Helper()
-		p, _, err := buildPipeline(context.Background(), signer)
+		p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("buildPipeline: %v", err)
 		}
@@ -139,7 +143,7 @@ func TestBuildPipelineRequiresDelegationChain(t *testing.T) {
 
 // TestBuildPipelineWiresTheToolExtractor: the shipped gateway used to pass a nil extractor,
 // so every request reached the PDP with an empty tool and every passport shipped an empty
-// scope — per-tool authorization (FR-16) was unreachable. With policy.MCPTools wired, the
+// scope — per-tool authorization (FR-16) was unreachable. With policy.MCPActions wired, the
 // tool inside the MCP JSON-RPC body reaches the decision, and the attenuation floor the
 // policy stage enforces becomes live: a tool the delegation gave up is denied even under
 // PASSPORT_ALLOW_ALL, which is exactly what a nil extractor could not do.
@@ -153,7 +157,7 @@ func TestBuildPipelineWiresTheToolExtractor(t *testing.T) {
 	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
 	t.Setenv("PASSPORT_ALLOW_ALL", "1") // the PDP permits everything: only attenuation can deny
 
-	p, _, err := buildPipeline(context.Background(), signer)
+	p, _, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 	if err != nil {
 		t.Fatalf("buildPipeline: %v", err)
 	}
@@ -286,7 +290,7 @@ func TestBuildPipelineReturnsKillSwitchForProbes(t *testing.T) {
 		} else {
 			t.Setenv("PASSPORT_DEV_NO_AUTH", devNoAuth)
 		}
-		_, ks, err := buildPipeline(context.Background(), signer)
+		_, ks, _, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
 		if err != nil {
 			t.Fatalf("PASSPORT_DEV_NO_AUTH=%q: %v", devNoAuth, err)
 		}
@@ -297,5 +301,241 @@ func TestBuildPipelineReturnsKillSwitchForProbes(t *testing.T) {
 		if err := ks.CheckFresh(); err != nil {
 			t.Fatalf("freshly built kill-switch reports stale: %v", err)
 		}
+	}
+}
+
+// --- authorization configuration (FR-16) ---------------------------------------------
+
+// policyFile writes a policy config and points PASSPORT_POLICY_FILE at it.
+func policyFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PASSPORT_POLICY_FILE", path)
+	return path
+}
+
+// decide runs a PDP the way the policy stage does.
+func decide(t *testing.T, pdp policy.PDP, method, tool string) types.Decision {
+	t.Helper()
+	d, err := pdp.Evaluate(context.Background(), policy.Input{Server: "demo", Method: method, Tool: tool})
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	return d
+}
+
+// TestBuildPDPFromPolicyFile is the fix for the gap this item names: an operator can configure
+// authorization without writing Go. Before it, the only reachable PDPs were "deny everything"
+// and the dev "allow everything".
+func TestBuildPDPFromPolicyFile(t *testing.T) {
+	clearAuthEnv(t)
+	policyFile(t, `{
+	  "version": 1,
+	  "policy": {"servers": {"demo": {
+	    "allow":  {"methods": ["initialize", "tools/list"], "tools": ["read"]},
+	    "review": {"tools": ["transfer"]}
+	  }}}
+	}`)
+
+	pdp, err := buildPDP(gateway.NewRegistry())
+	if err != nil {
+		t.Fatalf("buildPDP: %v", err)
+	}
+	cases := []struct {
+		name         string
+		method, tool string
+		want         types.Effect
+	}{
+		{"listed tool", "tools/call", "read", types.EffectAllow},
+		{"unlisted tool", "tools/call", "admin_delete", types.EffectDeny},
+		{"listed method", "tools/list", "", types.EffectAllow},
+		{"unlisted method", "resources/read", "", types.EffectDeny},
+		{"reviewed tool", "tools/call", "transfer", types.EffectReview},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decide(t, pdp, tc.method, tc.tool).Effect; got != tc.want {
+				t.Fatalf("effect = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildPDPDefaults: with nothing configured the gateway denies, and the dev switch still
+// works. Deny-by-default is the posture that must survive every wiring change (FR-15).
+func TestBuildPDPDefaults(t *testing.T) {
+	t.Run("no file denies everything", func(t *testing.T) {
+		clearAuthEnv(t)
+		pdp, err := buildPDP(gateway.NewRegistry())
+		if err != nil {
+			t.Fatalf("buildPDP: %v", err)
+		}
+		if d := decide(t, pdp, "tools/call", "read"); d.Allowed() {
+			t.Fatalf("want deny-by-default, got %+v", d)
+		}
+	})
+
+	t.Run("allow-all still works for dev", func(t *testing.T) {
+		clearAuthEnv(t)
+		t.Setenv("PASSPORT_ALLOW_ALL", "1")
+		pdp, err := buildPDP(gateway.NewRegistry())
+		if err != nil {
+			t.Fatalf("buildPDP: %v", err)
+		}
+		if d := decide(t, pdp, "tools/call", "anything"); !d.Allowed() {
+			t.Fatalf("PASSPORT_ALLOW_ALL=1 must allow, got %+v", d)
+		}
+	})
+}
+
+// TestBuildPDPRejectsAllowAllWithAPolicyFile: whichever won, the other would be a setting the
+// operator believes is in force and is not — and with allow-all winning, a carefully written
+// policy file would be silently ignored.
+func TestBuildPDPRejectsAllowAllWithAPolicyFile(t *testing.T) {
+	clearAuthEnv(t)
+	t.Setenv("PASSPORT_ALLOW_ALL", "1")
+	path := policyFile(t, `{"version":1,"policy":{"servers":{"demo":{"allow":{"tools":["read"]}}}}}`)
+
+	_, err := buildPDP(gateway.NewRegistry())
+	if err == nil {
+		t.Fatal("setting both must be a startup error")
+	}
+	for _, want := range []string{"PASSPORT_ALLOW_ALL", "PASSPORT_POLICY_FILE", path} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+// TestBuildPDPBrokenFileFailsStartup: a policy that cannot be read as written must stop the
+// gateway, naming what to fix. Starting on a half-understood policy is how an outage or an
+// open door gets shipped.
+func TestBuildPDPBrokenFileFailsStartup(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{"malformed json", "{\n  \"version\": 1,\n  \"policy\": {\n}\n", []string{"line "}},
+		{"misspelled key", `{"version":1,"policy":{"servers":{"demo":{"allow":{"tool":["read"]}}}}}`, []string{`unknown field "tool"`}},
+		{"empty entry", `{"version":1,"policy":{"servers":{"demo":{"allow":{"tools":["read",""]}}}}}`, []string{`server "demo"`, "allow.tools[1]"}},
+		{"no servers", `{"version":1,"policy":{"servers":{}}}`, []string{"no servers configured"}},
+		{"unsupported version", `{"version":7,"policy":{"servers":{"demo":{"allow":{"tools":["read"]}}}}}`, []string{"version 7 is not supported"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			path := policyFile(t, tc.content)
+			_, err := buildPDP(gateway.NewRegistry())
+			if err == nil {
+				t.Fatal("a broken policy file must fail startup")
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("error %q does not name the file", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+
+	t.Run("missing file", func(t *testing.T) {
+		clearAuthEnv(t)
+		t.Setenv("PASSPORT_POLICY_FILE", filepath.Join(t.TempDir(), "absent.json"))
+		if _, err := buildPDP(gateway.NewRegistry()); err == nil {
+			t.Fatal("a missing policy file must fail startup, not degrade to no policy")
+		}
+	})
+}
+
+// TestBuildPipelineWiresTheApprover: the gateway used to pass a nil approver, so every
+// EffectReview became "requires approval but no approver is configured" — an immediate deny,
+// with human-in-the-loop unreachable in the shipped binary. The stage must now hold the
+// request until an operator answers.
+func TestBuildPipelineWiresTheApprover(t *testing.T) {
+	signer, err := sts.NewLocalSigner("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearAuthEnv(t)
+	t.Setenv("PASSPORT_PRINCIPAL_MODE", "vc")
+	t.Setenv("PASSPORT_VC_TRUSTED_ISSUERS", "did:key:z6MkTrustedIssuer")
+	policyFile(t, `{"version":1,"policy":{"servers":{"demo":{"review":{"tools":["transfer"]}}}}}`)
+
+	p, _, approver, err := buildPipeline(context.Background(), signer, gateway.NewRegistry())
+	if err != nil {
+		t.Fatalf("buildPipeline: %v", err)
+	}
+	if approver == nil {
+		t.Fatal("no approver returned; the review API would have nothing to serve")
+	}
+	var stage gateway.Stage
+	for _, s := range p.Stages {
+		if s.Name() == "policy" {
+			stage = s
+		}
+	}
+
+	req := &gateway.Request{
+		Server:    "demo",
+		HTTP:      httptest.NewRequest(http.MethodPost, "/servers/demo/mcp", nil),
+		Principal: &types.Principal{ID: "principal-1"},
+		Calls:     []gateway.RPCCall{{Method: "tools/call", Tool: "transfer"}},
+	}
+	done := make(chan error, 1)
+	go func() { done <- stage.Handle(context.Background(), req) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(approver.Pending()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the action was not held for review")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !approver.Approve(approver.Pending()[0].ID) {
+		t.Fatal("approve reported the review was gone")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("an approved action must proceed: %v", err)
+	}
+}
+
+// TestApprovalTimeout: the window an operator has is configurable, and a value they got wrong
+// is a startup error rather than a silent fallback to the default.
+func TestApprovalTimeout(t *testing.T) {
+	cases := []struct {
+		env     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{env: "", want: 2 * time.Minute},
+		{env: "90s", want: 90 * time.Second},
+		{env: " 5m ", want: 5 * time.Minute},
+		{env: "0", want: 0}, // wait indefinitely
+		{env: "-1s", wantErr: true},
+		{env: "soon", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run("PASSPORT_APPROVAL_TIMEOUT="+tc.env, func(t *testing.T) {
+			t.Setenv("PASSPORT_APPROVAL_TIMEOUT", tc.env)
+			got, err := approvalTimeout()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got %s", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

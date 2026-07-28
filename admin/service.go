@@ -26,6 +26,7 @@ type Service struct {
 	registry *gateway.Registry
 	kill     revoke.Store
 	audit    *audit.HashChainLog // optional, enables the investigation view (P2-09)
+	reviews  Reviews             // optional, enables the human-approval queue (FR-16)
 }
 
 // Option configures a Service.

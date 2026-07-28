@@ -22,31 +22,73 @@ func call(tool string) gateway.RPCCall { return gateway.RPCCall{Method: "tools/c
 func method(m string) gateway.RPCCall  { return gateway.RPCCall{Method: m} }
 func notify(m string) gateway.RPCCall  { return gateway.RPCCall{Method: m, Notification: true} }
 
-func TestMCPToolsProjectsOneEntryPerCall(t *testing.T) {
+func TestMCPActionsProjectsOneEntryPerCall(t *testing.T) {
 	tests := []struct {
 		name string
 		req  *gateway.Request
-		want []string
+		want []Action
 	}{
 		{"no calls at all", authedReq("server-a"), nil},
-		{"single tools/call", batchReq(types.Scope{}, call("read")), []string{"read"}},
+		{"single tools/call", batchReq(types.Scope{}, call("read")), []Action{{Method: "tools/call", Tool: "read"}}},
 		{
-			// One entry per ELEMENT, empties included: the protocol methods still need a
-			// decision, they just do not name a tool.
+			// One entry per ELEMENT, tool-less ones included: the protocol methods still need a
+			// decision, they just carry their method instead of a tool.
 			name: "batch keeps position and arity",
 			req:  batchReq(types.Scope{}, method("initialize"), call("read"), notify("notifications/initialized"), call("write")),
-			want: []string{"", "read", "", "write"},
+			want: []Action{
+				{Method: "initialize"},
+				{Method: "tools/call", Tool: "read"},
+				{Method: "notifications/initialized"},
+				{Method: "tools/call", Tool: "write"},
+			},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := MCPTools(tc.req); !slices.Equal(got, tc.want) {
-				t.Fatalf("MCPTools = %v, want %v", got, tc.want)
+			if got := MCPActions(tc.req); !slices.Equal(got, tc.want) {
+				t.Fatalf("MCPActions = %v, want %v", got, tc.want)
 			}
 		})
 	}
-	if got := MCPTools(nil); got != nil {
-		t.Fatalf("MCPTools(nil) = %v, want nil", got)
+	if got := MCPActions(nil); got != nil {
+		t.Fatalf("MCPActions(nil) = %v, want nil", got)
+	}
+}
+
+// TestStageCarriesTheMethodToThePDP: the JSON-RPC method the gateway parsed must reach the
+// decision, or "allow tools/list but gate tools/call" cannot be expressed — both arrive at the
+// PDP looking identical when only the tool is plumbed through.
+func TestStageCarriesTheMethodToThePDP(t *testing.T) {
+	var seen []Input
+	pdp := Func(func(_ context.Context, in Input) (types.Decision, error) {
+		seen = append(seen, in)
+		return types.Decision{Effect: types.EffectAllow, Reason: "ok"}, nil
+	})
+	req := batchReq(types.Scope{}, method("initialize"), method("tools/list"), call("read"))
+
+	if err := Stage(pdp, MCPActions, nil).Handle(context.Background(), req); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	want := []Input{
+		{Method: "initialize"},
+		{Method: "tools/list"},
+		{Method: "tools/call", Tool: "read"},
+	}
+	for i, w := range want {
+		if seen[i].Method != w.Method || seen[i].Tool != w.Tool {
+			t.Fatalf("decision %d: method=%q tool=%q, want method=%q tool=%q",
+				i, seen[i].Method, seen[i].Tool, w.Method, w.Tool)
+		}
+	}
+
+	// A request carrying no JSON-RPC call at all is still decided once, under a method an
+	// operator can name in a policy file rather than under "".
+	seen = nil
+	if err := Stage(pdp, MCPActions, nil).Handle(context.Background(), authedReq("server-a")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if len(seen) != 1 || seen[0].Method != MethodNone || seen[0].Tool != "" {
+		t.Fatalf("bodyless request decided as %+v, want one decision for %q", seen, MethodNone)
 	}
 }
 
@@ -60,7 +102,7 @@ func TestStageDecidesEveryBatchElement(t *testing.T) {
 	})
 	req := batchReq(types.Scope{}, method("initialize"), call("read"), call("read"), call("write"))
 
-	if err := Stage(pdp, MCPTools, nil).Handle(context.Background(), req); err != nil {
+	if err := Stage(pdp, MCPActions, nil).Handle(context.Background(), req); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 	if want := []string{"", "read", "read", "write"}; !slices.Equal(asked, want) {
@@ -89,7 +131,7 @@ func TestStageDeniesWholeBatchIfAnyElementDenied(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req := batchReq(types.Scope{}, tc.calls...)
-			if err := Stage(al, MCPTools, nil).Handle(context.Background(), req); err == nil {
+			if err := Stage(al, MCPActions, nil).Handle(context.Background(), req); err == nil {
 				t.Fatal("a batch containing a denied element must be denied whole")
 			}
 			if req.Decision == nil || req.Decision.Allowed() {
@@ -103,7 +145,7 @@ func TestStageDeniesWholeBatchIfAnyElementDenied(t *testing.T) {
 
 	// The all-allowed batch still passes, so the denial above is the element and not the shape.
 	req := batchReq(types.Scope{}, call("read"), call("read"))
-	if err := Stage(al, MCPTools, nil).Handle(context.Background(), req); err != nil {
+	if err := Stage(al, MCPActions, nil).Handle(context.Background(), req); err != nil {
 		t.Fatalf("a batch of permitted elements should pass: %v", err)
 	}
 	if !slices.Equal(req.Scope.Tools, []string{"read"}) {
@@ -123,7 +165,7 @@ func TestStageBatchIsBoundedByTheDelegatedScope(t *testing.T) {
 	})
 
 	req := batchReq(grant, call("read"), call("write"))
-	err := Stage(pdp, MCPTools, nil).Handle(context.Background(), req)
+	err := Stage(pdp, MCPActions, nil).Handle(context.Background(), req)
 	if err == nil {
 		t.Fatal("a batch element outside the delegated scope must be denied")
 	}
@@ -136,7 +178,7 @@ func TestStageBatchIsBoundedByTheDelegatedScope(t *testing.T) {
 
 	// Every element inside the grant: allowed, scope is the intersection, budget survives.
 	ok := batchReq(grant, method("tools/list"), call("read"))
-	if err := Stage(pdp, MCPTools, nil).Handle(context.Background(), ok); err != nil {
+	if err := Stage(pdp, MCPActions, nil).Handle(context.Background(), ok); err != nil {
 		t.Fatalf("a batch inside the grant should pass: %v", err)
 	}
 	if !slices.Equal(ok.Scope.Tools, []string{"read"}) {
@@ -154,7 +196,7 @@ func TestStageProtocolMethodsDoNotNarrowScope(t *testing.T) {
 	grant := types.Scope{Tools: []string{"read"}}
 	req := batchReq(grant, method("initialize"))
 
-	if err := Stage(allowAny, MCPTools, nil).Handle(context.Background(), req); err != nil {
+	if err := Stage(allowAny, MCPActions, nil).Handle(context.Background(), req); err != nil {
 		t.Fatalf("a protocol method inside a scoped chain must not be denied by attenuation: %v", err)
 	}
 	if !slices.Equal(req.Scope.Tools, grant.Tools) {
@@ -169,12 +211,12 @@ func TestStageEmptyExtractionStillDecidesOnce(t *testing.T) {
 	var calls int
 	pdp := Func(func(_ context.Context, in Input) (types.Decision, error) {
 		calls++
-		if in.Tool != "" {
-			t.Errorf("tool = %q, want empty", in.Tool)
+		if in.Tool != "" || in.Method != MethodNone {
+			t.Errorf("decision = {method %q, tool %q}, want {%q, \"\"}", in.Method, in.Tool, MethodNone)
 		}
 		return types.Decision{Effect: types.EffectDeny, Reason: "deny-by-default"}, nil
 	})
-	empty := ToolExtractor(func(*gateway.Request) []string { return nil })
+	empty := ActionExtractor(func(*gateway.Request) []Action { return nil })
 
 	if err := Stage(pdp, empty, nil).Handle(context.Background(), authedReq("server-a")); err == nil {
 		t.Fatal("deny-by-default must fail closed when no tool was extracted")
